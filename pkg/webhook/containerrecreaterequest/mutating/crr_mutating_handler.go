@@ -190,7 +190,10 @@ func injectPodIntoContainerRecreateRequest(obj *appsv1alpha1.ContainerRecreateRe
 		if podContainer == nil {
 			return fmt.Errorf("container %s not found in Pod", c.Name)
 		}
-		podContainerStatus := util.GetContainerStatus(c.Name, pod)
+		// Look up status.initContainerStatuses as well, for a restartable init container
+		// (native sidecar container) reports its status there rather than in
+		// status.containerStatuses.
+		podContainerStatus := util.GetContainerStatusIncludingInit(c.Name, pod)
 		if podContainerStatus == nil {
 			return fmt.Errorf("not found %s containerStatus in Pod Status", c.Name)
 		} else if podContainerStatus.ContainerID == "" {
