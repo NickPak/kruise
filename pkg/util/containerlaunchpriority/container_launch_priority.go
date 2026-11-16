@@ -19,6 +19,7 @@ package containerlaunchpriority
 import (
 	"fmt"
 	"strconv"
+	"strings"
 
 	v1 "k8s.io/api/core/v1"
 
@@ -31,11 +32,25 @@ const (
 )
 
 func GetContainerPriority(c *v1.Container) *int {
+	if c == nil {
+		return nil
+	}
 	for _, e := range c.Env {
-		if e.Name == appspub.ContainerLaunchBarrierEnvName {
-			p, _ := strconv.Atoi(e.ValueFrom.ConfigMapKeyRef.Key[priorityStartIndex:])
-			return &p
+		if e.Name != appspub.ContainerLaunchBarrierEnvName {
+			continue
 		}
+		if e.ValueFrom == nil || e.ValueFrom.ConfigMapKeyRef == nil {
+			return nil
+		}
+		key := e.ValueFrom.ConfigMapKeyRef.Key
+		if !strings.HasPrefix(key, "p_") {
+			return nil
+		}
+		p, err := strconv.Atoi(key[priorityStartIndex:])
+		if err != nil {
+			return nil
+		}
+		return &p
 	}
 	return nil
 }

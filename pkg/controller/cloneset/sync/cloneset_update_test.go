@@ -18,6 +18,7 @@ package sync
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"testing"
@@ -25,6 +26,7 @@ import (
 
 	apps "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -989,6 +991,43 @@ func TestUpdate(t *testing.T) {
 	for _, mc := range cases {
 		t.Run(mc.name, func(t *testing.T) {
 			initialObjs := mc.initial()
+			for _, expectedPod := range mc.expectedPods {
+				for _, sourcePod := range mc.pods {
+					if sourcePod.Name != expectedPod.Name || (lifecycle.GetPodLifecycleState(expectedPod) != appspub.LifecycleStatePreparingUpdate &&
+						(!clonesetutils.EqualToRevisionHash("", expectedPod, mc.updateRevision.Name) || clonesetutils.EqualToRevisionHash("", sourcePod, mc.updateRevision.Name))) {
+						continue
+					}
+					var oldRevision *apps.ControllerRevision
+					for _, revision := range mc.revisions {
+						if clonesetutils.EqualToRevisionHash("", sourcePod, revision.Name) {
+							oldRevision = revision
+							break
+						}
+					}
+					prepared, err := inplaceupdate.PrepareUpdate(sourcePod, oldRevision, mc.updateRevision, clonesetcore.New(mc.cs).GetUpdateOptions())
+					if err != nil {
+						t.Fatal(err)
+					}
+					if prepared != nil {
+						plan, err := json.Marshal(prepared.Plan)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if expectedPod.Annotations == nil {
+							expectedPod.Annotations = map[string]string{}
+						}
+						expectedPod.Annotations[appspub.InPlaceUpdatePlanKey] = string(plan)
+						if raw, exists := appspub.GetInPlaceUpdateState(expectedPod); exists {
+							state := &appspub.InPlaceUpdateState{}
+							if err := json.Unmarshal([]byte(raw), state); err != nil {
+								t.Fatal(err)
+							}
+							state.UpdatePlan = prepared.Plan
+							expectedPod.Annotations[appspub.InPlaceUpdateStateKey] = util.DumpJSON(state)
+						}
+					}
+				}
+			}
 			fakeClient := fake.NewClientBuilder().WithObjects(initialObjs...).Build()
 			ctrl := &realControl{
 				fakeClient,
@@ -1035,6 +1074,300 @@ func TestUpdate(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func newCloneSetUpdatePlanTest(t *testing.T, image, cpu string) (*realControl, *appsv1beta1.CloneSet, *v1.Pod, *apps.ControllerRevision, *apps.ControllerRevision) {
+	t.Helper()
+	cs := &appsv1beta1.CloneSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "plan-test"},
+		Spec: appsv1beta1.CloneSetSpec{
+			Replicas: getInt32Pointer(1),
+			Lifecycle: &appspub.Lifecycle{InPlaceUpdate: &appspub.LifecycleHook{
+				FinalizersHandler: []string{"approval"},
+			}},
+			UpdateStrategy: appsv1beta1.CloneSetUpdateStrategy{RollingUpdate: &appsv1beta1.RollingUpdateCloneSetStrategy{
+				PodUpdatePolicy: appsv1beta1.InPlaceIfPossibleCloneSetPodUpdateStrategyType,
+			}},
+		},
+	}
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "pod-plan", UID: "pod-plan-uid", Finalizers: []string{"approval"},
+			Labels: map[string]string{
+				apps.ControllerRevisionHashLabelKey: "old", apps.DefaultDeploymentUniqueLabelKey: "old",
+				appspub.LifecycleStateKey: string(appspub.LifecycleStateNormal),
+			},
+		},
+		Spec: v1.PodSpec{
+			ReadinessGates: []v1.PodReadinessGate{{ConditionType: appspub.InPlaceUpdateReady}},
+			Containers: []v1.Container{{Name: "c1", Image: "foo1", Resources: v1.ResourceRequirements{
+				Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")},
+			}}},
+		},
+		Status: v1.PodStatus{
+			Phase:             v1.PodRunning,
+			Conditions:        []v1.PodCondition{{Type: appspub.InPlaceUpdateReady, Status: v1.ConditionTrue}},
+			ContainerStatuses: []v1.ContainerStatus{{Name: "c1", ImageID: "old-image-id"}},
+		},
+	}
+	revision := func(name string, spec v1.PodSpec) *apps.ControllerRevision {
+		raw, err := json.Marshal(map[string]interface{}{"spec": map[string]interface{}{"template": v1.PodTemplateSpec{Spec: spec}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &apps.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: name}, Data: runtime.RawExtension{Raw: raw}}
+	}
+	oldRevision := revision("old", pod.Spec)
+	target := pod.Spec.DeepCopy()
+	target.Containers[0].Image = image
+	target.Containers[0].Resources.Requests[v1.ResourceCPU] = resource.MustParse(cpu)
+	newRevision := revision("new", *target)
+	fakeClient := fake.NewClientBuilder().WithObjects(pod).Build()
+	control := &realControl{
+		Client: fakeClient, lifecycleControl: lifecycle.New(fakeClient),
+		inplaceControl: inplaceupdate.New(fakeClient, clonesetutils.RevisionAdapterImpl),
+		recorder:       record.NewFakeRecorder(10),
+	}
+	return control, cs, pod, oldRevision, newRevision
+}
+
+func TestCloneSetUpdatePlanBeforeHook(t *testing.T) {
+	defer utilfeature.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlaceWorkloadVerticalScaling, true)()
+	for _, tc := range []struct {
+		name, image, cpu string
+		changes          []string
+		restart          bool
+	}{
+		{name: "image", image: "foo2", cpu: "100m", changes: []string{appspub.InPlaceUpdateChangeImage}, restart: true},
+		{name: "resources", image: "foo1", cpu: "200m", changes: []string{appspub.InPlaceUpdateChangeResources}},
+		{name: "image and resources", image: "foo2", cpu: "200m", changes: []string{appspub.InPlaceUpdateChangeImage, appspub.InPlaceUpdateChangeResources}, restart: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			control, cs, pod, oldRevision, newRevision := newCloneSetUpdatePlanTest(t, tc.image, tc.cpu)
+			if _, err := control.updatePod(cs, clonesetcore.New(cs), newRevision, []*apps.ControllerRevision{oldRevision}, pod, nil); err != nil {
+				t.Fatal(err)
+			}
+			gotPod := &v1.Pod{}
+			if err := control.Get(context.TODO(), client.ObjectKeyFromObject(pod), gotPod); err != nil {
+				t.Fatal(err)
+			}
+			if lifecycle.GetPodLifecycleState(gotPod) != appspub.LifecycleStatePreparingUpdate || !reflect.DeepEqual(gotPod.Spec, pod.Spec) {
+				t.Fatalf("expected plan publication before mutation, got %s", util.DumpJSON(gotPod))
+			}
+			plan := &appspub.InPlaceUpdatePlan{}
+			if err := json.Unmarshal([]byte(gotPod.Annotations[appspub.InPlaceUpdatePlanKey]), plan); err != nil {
+				t.Fatal(err)
+			}
+			if plan.PlanID == "" || len(plan.Batches) != 1 || len(plan.Batches[0].Containers) != 1 {
+				t.Fatalf("unexpected update plan: %+v", plan)
+			}
+			entry := plan.Batches[0].Containers[0]
+			if entry.Name != "c1" || entry.RestartRequired != tc.restart || !reflect.DeepEqual(entry.Changes, tc.changes) {
+				t.Fatalf("unexpected container plan: %+v", entry)
+			}
+		})
+	}
+}
+
+func TestCloneSetUpdatePlanRearmsChangedTarget(t *testing.T) {
+	control, cs, pod, oldRevision, newRevision := newCloneSetUpdatePlanTest(t, "foo2", "100m")
+	if _, err := control.updatePod(cs, clonesetcore.New(cs), newRevision, []*apps.ControllerRevision{oldRevision}, pod, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := control.Get(context.TODO(), client.ObjectKeyFromObject(pod), pod); err != nil {
+		t.Fatal(err)
+	}
+	oldPlan := pod.Annotations[appspub.InPlaceUpdatePlanKey]
+	pod.Finalizers = nil
+	if err := control.Client.Update(context.TODO(), pod); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, _, changedRevision := newCloneSetUpdatePlanTest(t, "foo3", "100m")
+	changedRevision.Name = "changed"
+	if _, err := control.updatePod(cs, clonesetcore.New(cs), changedRevision, []*apps.ControllerRevision{oldRevision}, pod, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := control.Get(context.TODO(), client.ObjectKeyFromObject(pod), pod); err != nil {
+		t.Fatal(err)
+	}
+	if pod.Annotations[appspub.InPlaceUpdatePlanKey] == oldPlan || !lifecycle.IsPodHooked(cs.Spec.Lifecycle.InPlaceUpdate, pod) || pod.Spec.Containers[0].Image != "foo1" {
+		t.Fatalf("changed target must replace the plan and rearm approval before updating: %s", util.DumpJSON(pod))
+	}
+	approvedPlan := pod.Annotations[appspub.InPlaceUpdatePlanKey]
+	pod.Finalizers = nil
+	if err := control.Client.Update(context.TODO(), pod); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := control.updatePod(cs, clonesetcore.New(cs), changedRevision, []*apps.ControllerRevision{oldRevision}, pod, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := control.Get(context.TODO(), client.ObjectKeyFromObject(pod), pod); err != nil {
+		t.Fatal(err)
+	}
+	if pod.Spec.Containers[0].Image != "foo3" || lifecycle.GetPodLifecycleState(pod) != appspub.LifecycleStateUpdating || pod.Annotations[appspub.InPlaceUpdatePlanKey] != approvedPlan {
+		t.Fatalf("released current approval must execute once and retain its full plan: %s", util.DumpJSON(pod))
+	}
+}
+
+func TestCloneSetCancelledUpdatePlanResumesOriginalCycle(t *testing.T) {
+	for _, grace := range []bool{false, true} {
+		t.Run(fmt.Sprintf("grace=%v", grace), func(t *testing.T) {
+			control, cs, pod, oldRevision, newRevision := newCloneSetUpdatePlanTest(t, "foo2", "100m")
+			if grace {
+				cs.Spec.UpdateStrategy.RollingUpdate.InPlaceUpdateStrategy = &appspub.InPlaceUpdateStrategy{GracePeriodSeconds: 3600}
+			}
+			if _, err := control.updatePod(cs, clonesetcore.New(cs), newRevision, []*apps.ControllerRevision{oldRevision}, pod, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := control.Get(context.TODO(), client.ObjectKeyFromObject(pod), pod); err != nil {
+				t.Fatal(err)
+			}
+			originalPlan := pod.Annotations[appspub.InPlaceUpdatePlanKey]
+			pod.Finalizers = nil
+			if err := control.Client.Update(context.TODO(), pod); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := control.updatePod(cs, clonesetcore.New(cs), newRevision, []*apps.ControllerRevision{oldRevision}, pod, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := control.Get(context.TODO(), client.ObjectKeyFromObject(pod), pod); err != nil {
+				t.Fatal(err)
+			}
+			originalState := pod.Annotations[appspub.InPlaceUpdateStateKey]
+			originalGrace := pod.Annotations[appspub.InPlaceUpdateGraceKey]
+			if lifecycle.GetPodLifecycleState(pod) != appspub.LifecycleStateUpdating {
+				t.Fatal("expected original update to be executing")
+			}
+			_, _, _, _, changedRevision := newCloneSetUpdatePlanTest(t, "foo3", "100m")
+			changedRevision.Name = "changed"
+			if _, err := control.updatePod(cs, clonesetcore.New(cs), changedRevision, []*apps.ControllerRevision{oldRevision, newRevision}, pod, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := control.Get(context.TODO(), client.ObjectKeyFromObject(pod), pod); err != nil {
+				t.Fatal(err)
+			}
+			if lifecycle.GetPodLifecycleState(pod) != appspub.LifecycleStatePreparingUpdate || pod.Annotations[appspub.InPlaceUpdatePlanKey] == originalPlan {
+				t.Fatal("expected new target to suspend the original update while awaiting approval")
+			}
+			if updated, _, err := control.refreshPodState(cs, clonesetcore.New(cs), pod, newRevision.Name); err != nil || !updated {
+				t.Fatalf("expected cancellation to resume original update, updated=%v err=%v", updated, err)
+			}
+			if err := control.Get(context.TODO(), client.ObjectKeyFromObject(pod), pod); err != nil {
+				t.Fatal(err)
+			}
+			if lifecycle.GetPodLifecycleState(pod) != appspub.LifecycleStateUpdating || pod.Annotations[appspub.InPlaceUpdatePlanKey] != originalPlan ||
+				pod.Annotations[appspub.InPlaceUpdateStateKey] != originalState || pod.Annotations[appspub.InPlaceUpdateGraceKey] != originalGrace {
+				t.Fatalf("cancellation must restore original plan and execution without losing pending work: %s", util.DumpJSON(pod))
+			}
+		})
+	}
+}
+
+func TestCloneSetUpdatePlanLifecycleCleanup(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		source appspub.LifecycleStateType
+		target appspub.LifecycleStateType
+		hooked bool
+		retain bool
+	}{
+		{name: "completed unlabeled pod", source: "", target: ""},
+		{name: "completed normal pod", source: appspub.LifecycleStateNormal, target: appspub.LifecycleStateNormal},
+		{name: "cancel to normal", source: appspub.LifecycleStatePreparingUpdate, target: appspub.LifecycleStateNormal, hooked: true},
+		{name: "cancel to updated", source: appspub.LifecycleStatePreparingUpdate, target: appspub.LifecycleStateUpdated},
+		{name: "post hook completed", source: appspub.LifecycleStateUpdated, target: appspub.LifecycleStateNormal, hooked: true},
+		{name: "keep plan for post hook", source: appspub.LifecycleStateUpdating, target: appspub.LifecycleStateUpdated, retain: true},
+		{name: "update completed", source: appspub.LifecycleStateUpdating, target: appspub.LifecycleStateNormal, hooked: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			control, cs, pod, _, _ := newCloneSetUpdatePlanTest(t, "foo2", "100m")
+			pod.Labels[appspub.LifecycleStateKey] = string(tc.source)
+			pod.Annotations = map[string]string{appspub.InPlaceUpdatePlanKey: `{"planID":"obsolete","batches":[]}`}
+			if !tc.hooked {
+				pod.Finalizers = nil
+			}
+			if err := control.Client.Update(context.TODO(), pod); err != nil {
+				t.Fatal(err)
+			}
+			if updated, _, err := control.refreshPodState(cs, clonesetcore.New(cs), pod, "old"); err != nil || !updated {
+				t.Fatalf("expected lifecycle refresh, updated=%v err=%v", updated, err)
+			}
+			if err := control.Get(context.TODO(), client.ObjectKeyFromObject(pod), pod); err != nil {
+				t.Fatal(err)
+			}
+			_, hasPlan := pod.Annotations[appspub.InPlaceUpdatePlanKey]
+			if lifecycle.GetPodLifecycleState(pod) != tc.target || hasPlan != tc.retain {
+				t.Fatalf("unexpected lifecycle or plan after refresh: %s", util.DumpJSON(pod))
+			}
+		})
+	}
+}
+
+func TestCloneSetUpdatePlanPreservedWhileIncomplete(t *testing.T) {
+	for _, state := range []appspub.LifecycleStateType{"", appspub.LifecycleStateNormal, appspub.LifecycleStatePreparingUpdate} {
+		for _, grace := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/grace=%v", state, grace), func(t *testing.T) {
+				control, cs, pod, _, _ := newCloneSetUpdatePlanTest(t, "foo2", "100m")
+				pod.Labels[appspub.LifecycleStateKey] = string(state)
+				pod.Annotations = map[string]string{appspub.InPlaceUpdatePlanKey: `{"planID":"active","batches":[]}`}
+				updateState := appspub.InPlaceUpdateState{
+					Revision: "old", UpdateTimestamp: metav1.Now(), UpdateImages: true,
+					UpdatePlan:            &appspub.InPlaceUpdatePlan{PlanID: "active", Batches: []appspub.InPlaceUpdatePlanBatch{}},
+					LastContainerStatuses: map[string]appspub.InPlaceUpdateContainerStatus{"c1": {ImageID: "old-image-id"}},
+					NextContainerImages:   map[string]string{"c1": "foo2"},
+				}
+				if grace {
+					updateState.NextContainerImages = nil
+					pod.Annotations[appspub.InPlaceUpdateGraceKey] = util.DumpJSON(inplaceupdate.UpdateSpec{Revision: "old", GraceSeconds: 3600})
+				}
+				pod.Annotations[appspub.InPlaceUpdateStateKey] = util.DumpJSON(updateState)
+				if err := control.Client.Update(context.TODO(), pod); err != nil {
+					t.Fatal(err)
+				}
+				expectedState := state
+				resume := state == appspub.LifecycleStatePreparingUpdate
+				if resume {
+					expectedState = appspub.LifecycleStateUpdating
+				}
+				if updated, _, err := control.refreshPodState(cs, clonesetcore.New(cs), pod, "old"); err != nil || updated != resume {
+					t.Fatalf("incomplete update must preserve or resume original plan, updated=%v err=%v", updated, err)
+				}
+				if err := control.Get(context.TODO(), client.ObjectKeyFromObject(pod), pod); err != nil {
+					t.Fatal(err)
+				}
+				if pod.Annotations[appspub.InPlaceUpdatePlanKey] == "" || lifecycle.GetPodLifecycleState(pod) != expectedState {
+					t.Fatalf("expected active plan retained or restored: %s", util.DumpJSON(pod))
+				}
+			})
+		}
+	}
+}
+
+func TestCloneSetUpdatePlanClearedBeforeRecreate(t *testing.T) {
+	control, cs, pod, oldRevision, newRevision := newCloneSetUpdatePlanTest(t, "foo2", "100m")
+	cs.Spec.UpdateStrategy.RollingUpdate.PodUpdatePolicy = appsv1beta1.RecreateCloneSetPodUpdateStrategyType
+	pod.Annotations = map[string]string{appspub.InPlaceUpdatePlanKey: `{"planID":"obsolete","batches":[]}`}
+	if err := control.Client.Update(context.TODO(), pod); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := control.updatePod(cs, clonesetcore.New(cs), newRevision, []*apps.ControllerRevision{oldRevision}, pod, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := control.Get(context.TODO(), client.ObjectKeyFromObject(pod), pod); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := pod.Annotations[appspub.InPlaceUpdatePlanKey]; exists || pod.Labels[appsv1beta1.SpecifiedDeleteKey] != "" {
+		t.Fatalf("expected only plan cleanup before recreation: %s", util.DumpJSON(pod))
+	}
+	if _, err := control.updatePod(cs, clonesetcore.New(cs), newRevision, []*apps.ControllerRevision{oldRevision}, pod, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := control.Get(context.TODO(), client.ObjectKeyFromObject(pod), pod); err != nil {
+		t.Fatal(err)
+	}
+	if pod.Labels[appsv1beta1.SpecifiedDeleteKey] != "true" {
+		t.Fatalf("expected recreation after observing plan removal: %s", util.DumpJSON(pod))
 	}
 }
 

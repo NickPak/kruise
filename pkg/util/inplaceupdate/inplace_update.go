@@ -86,6 +86,11 @@ type UpdateOptions struct {
 	CheckContainersUpdateCompleted func(pod *v1.Pod, state *appspub.InPlaceUpdateState) error
 	CheckPodNeedsBeUnready         func(pod *v1.Pod, spec *UpdateSpec) bool
 	GetRevision                    func(rev *apps.ControllerRevision) string
+
+	// GeneratePlan must describe custom patcher semantics when PatchSpecToPod is overridden.
+	GeneratePlan func(pod *v1.Pod, spec *UpdateSpec) (*appspub.InPlaceUpdatePlan, error)
+	// PreparedUpdate binds lifecycle approval and execution to the same effective spec.
+	PreparedUpdate *PreparedUpdate
 }
 
 // Interface for managing pods in-place update.
@@ -140,6 +145,9 @@ func NewForInformer(informer coreinformers.PodInformer, revisionAdapter revision
 
 func (c *realControl) Refresh(pod *v1.Pod, opts *UpdateOptions) RefreshResult {
 	opts = SetOptionsDefaults(opts)
+	if isUpdatePlanPreparing(pod) {
+		return RefreshResult{}
+	}
 
 	// check if it is in grace period
 	if gracePeriod, _ := appspub.GetInPlaceUpdateGrace(pod); gracePeriod != "" {
@@ -220,6 +228,9 @@ func (c *realControl) finishGracePeriod(pod *v1.Pod, opts *UpdateOptions) (time.
 			return err
 		}
 
+		if isUpdatePlanPreparing(clone) {
+			return nil
+		}
 		spec := UpdateSpec{}
 		updateSpecJSON, ok := appspub.GetInPlaceUpdateGrace(clone)
 		if !ok {
@@ -258,11 +269,16 @@ func (c *realControl) finishGracePeriod(pod *v1.Pod, opts *UpdateOptions) (time.
 				patchResources := verticalUpdateImpl.GenerateResourcePatch(clone, expectedResources)
 				if patchResources != nil {
 					if adp, ok := c.podAdapter.(podadapter.AdapterWithPatch); ok {
-						cloneCopy := clone.DeepCopy()
-						_, err = adp.PatchPodResource(cloneCopy, client.RawPatch(types.StrategicMergePatchType, patchResources))
+						patchResources, err = guardResourcePatch(clone, patchResources)
 						if err != nil {
 							return err
 						}
+						cloneCopy := clone.DeepCopy()
+						patched, patchErr := adp.PatchPodResource(cloneCopy, client.RawPatch(types.StrategicMergePatchType, patchResources))
+						if patchErr != nil {
+							return patchErr
+						}
+						applyResizeResult(clone, patched)
 					}
 				}
 			}
@@ -284,6 +300,9 @@ func (c *realControl) updateNextBatch(pod *v1.Pod, opts *UpdateOptions) (bool, e
 			return err
 		}
 
+		if isUpdatePlanPreparing(clone) {
+			return nil
+		}
 		state := appspub.InPlaceUpdateState{}
 		stateStr, ok := appspub.GetInPlaceUpdateState(clone)
 		originalState, _ := appspub.GetInPlaceUpdateState(pod)
@@ -321,11 +340,16 @@ func (c *realControl) updateNextBatch(pod *v1.Pod, opts *UpdateOptions) (bool, e
 			patchResources := verticalUpdateImpl.GenerateResourcePatch(clone, expectedResources)
 			if patchResources != nil {
 				if adp, ok := c.podAdapter.(podadapter.AdapterWithPatch); ok {
-					cloneCopy := clone.DeepCopy()
-					_, err = adp.PatchPodResource(cloneCopy, client.RawPatch(types.StrategicMergePatchType, patchResources))
+					patchResources, err = guardResourcePatch(clone, patchResources)
 					if err != nil {
 						return err
 					}
+					cloneCopy := clone.DeepCopy()
+					patched, patchErr := adp.PatchPodResource(cloneCopy, client.RawPatch(types.StrategicMergePatchType, patchResources))
+					if patchErr != nil {
+						return patchErr
+					}
+					applyResizeResult(clone, patched)
 				}
 			}
 		}
@@ -345,8 +369,27 @@ func (c *realControl) CanUpdateInPlace(oldRevision, newRevision *apps.Controller
 func (c *realControl) Update(pod *v1.Pod, oldRevision, newRevision *apps.ControllerRevision, opts *UpdateOptions) UpdateResult {
 	opts = SetOptionsDefaults(opts)
 
-	// 1. calculate inplace update spec
-	spec := opts.CalculateSpec(oldRevision, newRevision, opts)
+	// Controllers using lifecycle previews execute the same spec that was prepared for approval.
+	// Callers without a preparation retain the original update API and behavior.
+	var spec *UpdateSpec
+	if opts.PreparedUpdate != nil {
+		if err := opts.PreparedUpdate.validateExecution(pod, false, opts); err != nil {
+			return UpdateResult{InPlaceUpdate: true, UpdateErr: err}
+		}
+		if oldRevision == nil || newRevision == nil || opts.PreparedUpdate.sourceRevision != oldRevision.Name {
+			return UpdateResult{InPlaceUpdate: true, UpdateErr: fmt.Errorf("in-place update plan source revision changed")}
+		}
+		targetRevision := newRevision.Name
+		if opts.GetRevision != nil {
+			targetRevision = opts.GetRevision(newRevision)
+		}
+		if opts.PreparedUpdate.Spec.Revision != targetRevision {
+			return UpdateResult{InPlaceUpdate: true, UpdateErr: fmt.Errorf("in-place update plan target revision changed")}
+		}
+		spec = opts.PreparedUpdate.Spec
+	} else {
+		spec = opts.CalculateSpec(oldRevision, newRevision, opts)
+	}
 	if spec == nil {
 		return UpdateResult{}
 	}
@@ -367,6 +410,11 @@ func (c *realControl) Update(pod *v1.Pod, oldRevision, newRevision *apps.Control
 			clone, err := c.podAdapter.GetPod(pod.Namespace, pod.Name)
 			if err != nil {
 				return err
+			}
+			if opts.PreparedUpdate != nil {
+				if err := opts.PreparedUpdate.validateExecution(clone, false, opts); err != nil {
+					return err
+				}
 			}
 			// The Pod from informer cache may be not synced as the latest, so we
 			// can't use hasEqualCondition() to compare with the newCondition here.
@@ -393,10 +441,25 @@ func (c *realControl) Update(pod *v1.Pod, oldRevision, newRevision *apps.Control
 
 func (c *realControl) updatePodInPlace(pod *v1.Pod, spec *UpdateSpec, opts *UpdateOptions) (string, error) {
 	var newResourceVersion string
+	resourcePatchApplied := false
 	retryErr := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		clone, err := c.podAdapter.GetPod(pod.Namespace, pod.Name)
 		if err != nil {
 			return err
+		}
+		if opts.PreparedUpdate != nil {
+			prepared := opts.PreparedUpdate
+			if c.revisionAdapter.EqualToRevisionHash("", prepared.inputPod, prepared.sourceRevision) &&
+				!c.revisionAdapter.EqualToRevisionHash("", clone, prepared.sourceRevision) {
+				return fmt.Errorf("in-place update plan source Pod revision changed")
+			}
+			if err := prepared.validateExecution(clone, resourcePatchApplied, opts); err != nil {
+				return err
+			}
+			if clone.Annotations == nil {
+				clone.Annotations = map[string]string{}
+			}
+			clone.Annotations[appspub.InPlaceUpdatePlanKey] = opts.PreparedUpdate.planJSON
 		}
 
 		// update new revision
@@ -415,6 +478,9 @@ func (c *realControl) updatePodInPlace(pod *v1.Pod, spec *UpdateSpec, opts *Upda
 			UpdateImages:          len(spec.ContainerImages) > 0 || len(spec.InitContainerImages) > 0,
 			UpdateResources:       len(spec.ContainerResources) > 0,
 		}
+		if opts.PreparedUpdate != nil {
+			inPlaceUpdateState.UpdatePlan = opts.PreparedUpdate.Plan.DeepCopy()
+		}
 		inPlaceUpdateStateJSON, _ := json.Marshal(inPlaceUpdateState)
 		clone.Annotations[appspub.InPlaceUpdateStateKey] = string(inPlaceUpdateStateJSON)
 		delete(clone.Annotations, appspub.InPlaceUpdateStateKeyOld)
@@ -430,13 +496,19 @@ func (c *realControl) updatePodInPlace(pod *v1.Pod, spec *UpdateSpec, opts *Upda
 				patchResources := verticalUpdateImpl.GenerateResourcePatch(clone, expectedResources)
 				if patchResources != nil {
 					if adp, ok := c.podAdapter.(podadapter.AdapterWithPatch); ok {
-						cloneCopy := clone.DeepCopy()
-						_, err := adp.PatchPodResource(cloneCopy, client.RawPatch(types.StrategicMergePatchType, patchResources))
+						patchResources, err = guardResourcePatch(clone, patchResources)
 						if err != nil {
-							klog.InfoS(fmt.Sprintf("updatePodInPlace resize patch failed: %s/%s, error: %v", cloneCopy.Namespace, cloneCopy.Name, err))
 							return err
 						}
-						newResourceVersion = cloneCopy.ResourceVersion
+						cloneCopy := clone.DeepCopy()
+						patched, patchErr := adp.PatchPodResource(cloneCopy, client.RawPatch(types.StrategicMergePatchType, patchResources))
+						if patchErr != nil {
+							klog.InfoS(fmt.Sprintf("updatePodInPlace resize patch failed: %s/%s, error: %v", cloneCopy.Namespace, cloneCopy.Name, patchErr))
+							return patchErr
+						}
+						resourcePatchApplied = true
+						applyResizeResult(clone, patched)
+						newResourceVersion = clone.ResourceVersion
 					}
 				}
 			}

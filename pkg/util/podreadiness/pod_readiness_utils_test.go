@@ -123,3 +123,46 @@ func TestPodReadiness(t *testing.T) {
 		t.Fatalf("expect condition true, but not")
 	}
 }
+
+func TestReadinessRejectsSameNameReplacement(t *testing.T) {
+	for _, remove := range []bool{false, true} {
+		name := "add"
+		if remove {
+			name = "remove"
+		}
+		t.Run(name, func(t *testing.T) {
+			pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "replacement", Namespace: "default", UID: "new-uid"}, Spec: v1.PodSpec{ReadinessGates: []v1.PodReadinessGate{{ConditionType: appspub.KruisePodReadyConditionType}}}}
+			msg := Message{UserAgent: "lifecycle", Key: "preUpdateHook"}
+			condition := v1.PodCondition{Type: appspub.KruisePodReadyConditionType, Status: v1.ConditionTrue}
+			if remove {
+				_, messages := addMessage("", msg)
+				condition.Status, condition.Message = v1.ConditionFalse, messages.dump()
+			}
+			pod.Status.Conditions = []v1.PodCondition{condition}
+			cli := fake.NewClientBuilder().WithScheme(clientgoscheme.Scheme).WithStatusSubresource(&v1.Pod{}).WithObjects(pod).Build()
+			if err := cli.Get(context.Background(), types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, pod); err != nil {
+				t.Fatal(err)
+			}
+			before := pod.DeepCopy()
+			stale := pod.DeepCopy()
+			stale.UID = "old-uid"
+			control := NewForAdapter(&podadapter.AdapterRuntimeClient{Client: cli})
+			var err error
+			if remove {
+				err = control.RemoveNotReadyKey(stale, msg)
+			} else {
+				err = control.AddNotReadyKey(stale, msg)
+			}
+			if err == nil {
+				t.Fatal("stale Pod identity was accepted for a readiness write")
+			}
+			stored := &v1.Pod{}
+			if err := cli.Get(context.Background(), types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, stored); err != nil {
+				t.Fatal(err)
+			}
+			if stored.ResourceVersion != before.ResourceVersion || stored.UID != before.UID || GetReadinessCondition(stored).Status != condition.Status || GetReadinessCondition(stored).Message != condition.Message {
+				t.Fatal("stale readiness operation changed the replacement Pod")
+			}
+		})
+	}
+}

@@ -752,6 +752,11 @@ func (ssc *defaultStatefulSetControl) handleSpecifiedDeletedPods(
 }
 
 func (ssc *defaultStatefulSetControl) deletePod(set *appsv1beta1.StatefulSet, pod *v1.Pod) (modified, actualDeleting bool, err error) {
+	if updated, _, err := inplaceupdate.ClearUpdatePlan(pod, ssc.lifecycleControl); err != nil {
+		return false, false, err
+	} else if updated {
+		return true, false, nil
+	}
 	if set.Spec.Lifecycle != nil && lifecycle.IsPodHooked(set.Spec.Lifecycle.PreDelete, pod) {
 		markPodNotReady := set.Spec.Lifecycle.PreDelete.MarkPodNotReady
 		if updated, _, err := ssc.lifecycleControl.UpdatePodLifecycle(pod, appspub.LifecycleStatePreparingDelete, markPodNotReady); err != nil {
@@ -785,6 +790,14 @@ func (ssc *defaultStatefulSetControl) refreshPodState(set *appsv1beta1.StatefulS
 
 	var state appspub.LifecycleStateType
 	switch lifecycle.GetPodLifecycleState(pod) {
+	case "", appspub.LifecycleStateNormal:
+		if _, exists := pod.Annotations[appspub.InPlaceUpdatePlanKey]; exists && opts.CheckPodUpdateCompleted(pod) == nil {
+			if updated, _, err := inplaceupdate.ClearUpdatePlan(pod, ssc.lifecycleControl); err != nil {
+				return false, 0, err
+			} else if updated {
+				return true, res.DelayDuration, nil
+			}
+		}
 	case appspub.LifecycleStatePreparingNormal:
 		if set.Spec.Lifecycle == nil ||
 			set.Spec.Lifecycle.PreNormal == nil ||
@@ -796,6 +809,14 @@ func (ssc *defaultStatefulSetControl) refreshPodState(set *appsv1beta1.StatefulS
 		// then rollback, do not need update pod inplace since it is the update revision,
 		// so just update pod lifecycle state. ref: https://github.com/openkruise/kruise/issues/1156
 		if getPodRevision(pod) == updateRevision {
+			if opts.CheckPodUpdateCompleted(pod) != nil {
+				if updated, _, err := inplaceupdate.ResumeUpdatePlan(pod, updateRevision, ssc.lifecycleControl); err != nil {
+					return false, 0, err
+				} else if updated {
+					return true, res.DelayDuration, nil
+				}
+				break
+			}
 			if set.Spec.Lifecycle != nil && !lifecycle.IsPodAllHooked(set.Spec.Lifecycle.InPlaceUpdate, pod) {
 				state = appspub.LifecycleStateUpdated
 			} else {
@@ -823,7 +844,14 @@ func (ssc *defaultStatefulSetControl) refreshPodState(set *appsv1beta1.StatefulS
 		if set.Spec.Lifecycle != nil && set.Spec.Lifecycle.InPlaceUpdate != nil {
 			markPodNotReady = set.Spec.Lifecycle.InPlaceUpdate.MarkPodNotReady
 		}
-		if updated, _, err := ssc.lifecycleControl.UpdatePodLifecycle(pod, state, markPodNotReady); err != nil {
+		var updated bool
+		var err error
+		if state == appspub.LifecycleStateNormal || lifecycle.GetPodLifecycleState(pod) == appspub.LifecycleStatePreparingUpdate {
+			updated, _, err = ssc.lifecycleControl.UpdatePodLifecycleWithMetadata(pod, state, markPodNotReady, nil, appspub.RemoveInPlaceUpdatePlan)
+		} else {
+			updated, _, err = ssc.lifecycleControl.UpdatePodLifecycle(pod, state, markPodNotReady)
+		}
+		if err != nil {
 			return false, 0, err
 		} else if updated {
 			klog.V(3).InfoS("AdvancedStatefulSet updated pod lifecycle", "statefulSet", klog.KObj(set), "pod", klog.KObj(pod), "lifecycleState", state)
@@ -859,30 +887,25 @@ func (ssc *defaultStatefulSetControl) inPlaceUpdatePod(
 		opts.GracePeriodSeconds = set.Spec.UpdateStrategy.RollingUpdate.InPlaceUpdateStrategy.GracePeriodSeconds
 	}
 
-	if ssc.inplaceControl.CanUpdateInPlace(oldRevision, updateRevision, opts) {
+	opts = inplaceupdate.SetOptionsDefaults(opts)
+	prepared, err := inplaceupdate.PrepareUpdate(pod, oldRevision, updateRevision, opts)
+	if err != nil {
+		return true, err
+	}
+	if prepared != nil {
+		var inPlaceUpdateHandler *appspub.LifecycleHook
+		if set.Spec.Lifecycle != nil {
+			inPlaceUpdateHandler = set.Spec.Lifecycle.InPlaceUpdate
+		}
+		if updated, _, err := inplaceupdate.SyncUpdatePlan(pod, prepared, inPlaceUpdateHandler, ssc.lifecycleControl); err != nil {
+			return true, err
+		} else if updated {
+			klog.V(3).InfoS("StatefulSet synchronized in-place update plan", "statefulSet", klog.KObj(set), "pod", klog.KObj(pod))
+			return true, nil
+		}
 		state := lifecycle.GetPodLifecycleState(pod)
 		switch state {
-		case "", appspub.LifecycleStatePreparingNormal, appspub.LifecycleStateNormal:
-			var err error
-			var updated bool
-			if set.Spec.Lifecycle != nil && lifecycle.IsPodHooked(set.Spec.Lifecycle.InPlaceUpdate, pod) {
-				markPodNotReady := set.Spec.Lifecycle.InPlaceUpdate.MarkPodNotReady
-				if updated, _, err = ssc.lifecycleControl.UpdatePodLifecycle(pod, appspub.LifecycleStatePreparingUpdate, markPodNotReady); err == nil && updated {
-					klog.V(3).InfoS("StatefulSet updated pod lifecycle to PreparingUpdate", "statefulSet", klog.KObj(set), "pod", klog.KObj(pod))
-				}
-				return true, err
-			}
-		case appspub.LifecycleStateUpdated:
-			var err error
-			var updated bool
-			var inPlaceUpdateHandler *appspub.LifecycleHook
-			if set.Spec.Lifecycle != nil {
-				inPlaceUpdateHandler = set.Spec.Lifecycle.InPlaceUpdate
-			}
-			if updated, _, err = ssc.lifecycleControl.UpdatePodLifecycleWithHandler(pod, appspub.LifecycleStatePreparingUpdate, inPlaceUpdateHandler); err == nil && updated {
-				klog.V(3).InfoS("StatefulSet updated pod lifecycle to PreparingUpdate", "statefulSet", klog.KObj(set), "pod", klog.KObj(pod))
-			}
-			return true, err
+		case "", appspub.LifecycleStatePreparingNormal, appspub.LifecycleStateNormal, appspub.LifecycleStateUpdated:
 		case appspub.LifecycleStatePreparingUpdate:
 			if set.Spec.Lifecycle != nil && lifecycle.IsPodHooked(set.Spec.Lifecycle.InPlaceUpdate, pod) {
 				return true, nil
@@ -892,6 +915,7 @@ func (ssc *defaultStatefulSetControl) inPlaceUpdatePod(
 			return true, fmt.Errorf("not allowed to in-place update pod %s in state %s", pod.Name, state)
 		}
 
+		opts.PreparedUpdate = prepared
 		if state != "" {
 			opts.AdditionalFuncs = append(opts.AdditionalFuncs, lifecycle.SetPodLifecycle(appspub.LifecycleStateUpdating))
 		}
@@ -908,6 +932,9 @@ func (ssc *defaultStatefulSetControl) inPlaceUpdatePod(
 			}
 			ssc.recorder.Eventf(set, v1.EventTypeWarning, "FailedUpdatePodInPlace", "failed to update pod %s in-place(revision %v): %v", pod.Name, updateRevision.Name, res.UpdateErr)
 			return res.InPlaceUpdate, res.UpdateErr
+		}
+		if res.UpdateErr != nil {
+			return true, res.UpdateErr
 		}
 	}
 

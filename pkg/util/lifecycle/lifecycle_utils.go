@@ -18,6 +18,7 @@ package lifecycle
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -44,6 +45,7 @@ const (
 type Interface interface {
 	UpdatePodLifecycle(pod *v1.Pod, state appspub.LifecycleStateType, markPodNotReady bool) (bool, *v1.Pod, error)
 	UpdatePodLifecycleWithHandler(pod *v1.Pod, state appspub.LifecycleStateType, inPlaceUpdateHandler *appspub.LifecycleHook) (bool, *v1.Pod, error)
+	UpdatePodLifecycleWithMetadata(pod *v1.Pod, state appspub.LifecycleStateType, markPodNotReady bool, handler *appspub.LifecycleHook, mutate func(*v1.Pod)) (bool, *v1.Pod, error)
 }
 
 type realControl struct {
@@ -207,6 +209,73 @@ func (c *realControl) UpdatePodLifecycleWithHandler(pod *v1.Pod, state appspub.L
 		gotPod, err = c.adp.UpdatePod(pod)
 	}
 
+	return true, gotPod, err
+}
+
+// UpdatePodLifecycleWithMetadata updates lifecycle and extra metadata in one write.
+// Only labels, annotations and finalizers changed by mutate are persisted.
+// Mutate must preserve lifecycle state/timestamp; handler labels must not use reserved keys.
+// Conflicts are returned so the caller can recompute metadata from a fresh pod.
+func (c *realControl) UpdatePodLifecycleWithMetadata(pod *v1.Pod, state appspub.LifecycleStateType, markPodNotReady bool, handler *appspub.LifecycleHook, mutate func(*v1.Pod)) (updated bool, gotPod *v1.Pod, err error) {
+	if pod == nil {
+		return false, nil, nil
+	}
+	if handler != nil {
+		for _, key := range []string{appspub.LifecycleStateKey, appspub.LifecycleTimestampKey, appspub.InPlaceUpdatePlanKey} {
+			if _, exists := handler.LabelsHandler[key]; exists {
+				return false, nil, fmt.Errorf("lifecycle hook label collides with reserved metadata key %q", key)
+			}
+		}
+	}
+	if markPodNotReady || IsHookMarkPodNotReady(handler) {
+		readinessState := state
+		if state == appspub.LifecycleStateNormal {
+			readinessState = appspub.LifecycleStateUpdated
+		}
+		if err = c.executePodNotReadyPolicy(pod.DeepCopy(), readinessState); err != nil {
+			return false, nil, err
+		}
+	}
+
+	clone := pod.DeepCopy()
+	if GetPodLifecycleState(pod) != state {
+		SetPodLifecycle(state)(clone)
+	}
+	if mutate != nil {
+		metadataPod := clone.DeepCopy()
+		mutate(metadataPod)
+		stateValue, stateExists := clone.Labels[appspub.LifecycleStateKey]
+		mutatedState, mutatedStateExists := metadataPod.Labels[appspub.LifecycleStateKey]
+		timestamp, timestampExists := clone.Annotations[appspub.LifecycleTimestampKey]
+		mutatedTimestamp, mutatedTimestampExists := metadataPod.Annotations[appspub.LifecycleTimestampKey]
+		if stateValue != mutatedState || stateExists != mutatedStateExists || timestamp != mutatedTimestamp || timestampExists != mutatedTimestampExists {
+			return false, nil, fmt.Errorf("metadata mutation must not change lifecycle state or timestamp")
+		}
+		clone.Labels = metadataPod.Labels
+		clone.Annotations = metadataPod.Annotations
+		clone.Finalizers = metadataPod.Finalizers
+	}
+	if handler != nil {
+		if len(handler.LabelsHandler) > 0 && clone.Labels == nil {
+			clone.Labels = make(map[string]string)
+		}
+		for key, value := range handler.LabelsHandler {
+			clone.Labels[key] = value
+		}
+		for _, finalizer := range handler.FinalizersHandler {
+			controllerutil.AddFinalizer(clone, finalizer)
+		}
+	}
+	if reflect.DeepEqual(pod.ObjectMeta, clone.ObjectMeta) {
+		return false, pod, nil
+	}
+
+	if adp, ok := c.adp.(podadapter.AdapterWithPatch); ok {
+		patch := client.MergeFromWithOptions(pod, client.MergeFromWithOptimisticLock{})
+		gotPod, err = adp.PatchPod(clone, patch)
+	} else {
+		gotPod, err = c.adp.UpdatePod(clone)
+	}
 	return true, gotPod, err
 }
 

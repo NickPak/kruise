@@ -294,7 +294,7 @@ func TestGetContainerPriority_EdgeCases(t *testing.T) {
 					},
 				},
 			},
-			expected: intPtr(5),
+			expected: nil,
 		},
 		{
 			name: "container with non-numeric priority",
@@ -311,7 +311,7 @@ func TestGetContainerPriority_EdgeCases(t *testing.T) {
 					},
 				},
 			},
-			expected: intPtr(0),
+			expected: nil,
 		},
 		{
 			name: "container with very large priority",
@@ -347,15 +347,6 @@ func TestGetContainerPriority_EdgeCases(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// For cases that would panic, we need to handle them specially
-			if tt.name == "container with env var but no ValueFrom" ||
-				tt.name == "container with invalid key format (too short)" {
-				assert.Panics(t, func() {
-					GetContainerPriority(tt.container)
-				})
-				return
-			}
-
 			result := GetContainerPriority(tt.container)
 			if tt.expected == nil {
 				assert.Nil(t, result)

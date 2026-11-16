@@ -18,6 +18,7 @@ package statefulset
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -43,9 +44,11 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/kubernetes/scheme"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	storagelisters "k8s.io/client-go/listers/storage/v1"
 	"k8s.io/client-go/tools/cache"
@@ -57,6 +60,7 @@ import (
 	utilpointer "k8s.io/utils/pointer"
 	"k8s.io/utils/ptr"
 
+	"github.com/openkruise/kruise/apis"
 	appspub "github.com/openkruise/kruise/apis/apps/pub"
 	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
 	appsv1beta1 "github.com/openkruise/kruise/apis/apps/v1beta1"
@@ -76,6 +80,7 @@ import (
 type invariantFunc func(set *appsv1beta1.StatefulSet, om *fakeObjectManager) error
 
 func setupController(client clientset.Interface, kruiseClient kruiseclientset.Interface) (*fakeObjectManager, *fakeStatefulSetStatusUpdater, StatefulSetControlInterface, chan struct{}) {
+	utilruntime.Must(apis.AddToScheme(scheme.Scheme))
 	informerFactory := informers.NewSharedInformerFactory(client, controller.NoResyncPeriodFunc())
 	kruiseInformerFactory := kruiseinformers.NewSharedInformerFactory(kruiseClient, controller.NoResyncPeriodFunc())
 	om := newFakeObjectManager(informerFactory, kruiseInformerFactory)
@@ -2444,7 +2449,7 @@ func TestStatefulSetControlInPlaceUpdate(t *testing.T) {
 	}
 
 	// should not update pod 1, because of pod2 status not changed
-	if err = ssc.UpdateStatefulSet(context.TODO(), set, originalPods); err != nil {
+	if err = ssc.UpdateStatefulSet(context.TODO(), set, pods); err != nil {
 		t.Fatal(err)
 	}
 	pods, err = spc.podsLister.Pods(set.Namespace).List(selector)
@@ -2533,6 +2538,180 @@ func TestStatefulSetControlInPlaceUpdate(t *testing.T) {
 	}
 }
 
+func TestStatefulSetCompletedUpdatePlanCleanup(t *testing.T) {
+	for _, state := range []appspub.LifecycleStateType{"", appspub.LifecycleStateNormal} {
+		t.Run(string(state), func(t *testing.T) {
+			pod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "pod-plan", Namespace: "test", UID: "pod-plan-uid", ResourceVersion: "1",
+					Labels:      map[string]string{apps.StatefulSetRevisionLabel: "target", appspub.LifecycleStateKey: string(state)},
+					Annotations: map[string]string{appspub.InPlaceUpdatePlanKey: `{"planID":"completed","batches":[]}`},
+				},
+			}
+			client := fake.NewSimpleClientset(pod)
+			control := &defaultStatefulSetControl{
+				inplaceControl:   inplaceupdate.NewForTypedClient(client, revisionadapter.NewDefaultImpl()),
+				lifecycleControl: lifecycle.NewForTypedClient(client),
+			}
+			if updated, _, err := control.refreshPodState(&appsv1beta1.StatefulSet{}, pod, "target"); err != nil || !updated {
+				t.Fatalf("expected completed plan cleanup, updated=%v err=%v", updated, err)
+			}
+			gotPod, err := client.CoreV1().Pods(pod.Namespace).Get(context.TODO(), pod.Name, metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, exists := gotPod.Annotations[appspub.InPlaceUpdatePlanKey]; exists || lifecycle.GetPodLifecycleState(gotPod) != state {
+				t.Fatalf("expected same-state removal of completed plan: %s", util.DumpJSON(gotPod))
+			}
+		})
+	}
+}
+
+func TestStatefulSetCancelledUpdatePlanResumesOriginalCycle(t *testing.T) {
+	for _, grace := range []bool{false, true} {
+		t.Run(fmt.Sprintf("grace=%v", grace), func(t *testing.T) {
+			pod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "pod-plan", Namespace: "test", UID: "pod-plan-uid", ResourceVersion: "1",
+					Labels:      map[string]string{apps.StatefulSetRevisionLabel: "original", appspub.LifecycleStateKey: string(appspub.LifecycleStateUpdating)},
+					Annotations: map[string]string{},
+				},
+				Spec:   v1.PodSpec{Containers: []v1.Container{{Name: "c1", Image: "foo1"}, {Name: "c2", Image: "foo1"}}},
+				Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{Name: "c1", ImageID: "old-image-id"}, {Name: "c2", ImageID: "old-image-id"}}},
+			}
+			revision := func(name string, image string) *apps.ControllerRevision {
+				spec := pod.Spec.DeepCopy()
+				spec.Containers[0].Image = image
+				spec.Containers[1].Image = "foo2"
+				raw, err := json.Marshal(map[string]interface{}{"spec": map[string]interface{}{"template": v1.PodTemplateSpec{Spec: *spec}}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return &apps.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: name}, Data: apiruntime.RawExtension{Raw: raw}}
+			}
+			originalRevision := revision("original", "foo2")
+			newRevision := revision("changed", "foo3")
+			originalPlan := util.DumpJSON(appspub.InPlaceUpdatePlan{
+				PlanID: "original-plan", Batches: []appspub.InPlaceUpdatePlanBatch{
+					{Containers: []appspub.InPlaceUpdatePlanContainer{{Name: "c1", Changes: []string{appspub.InPlaceUpdateChangeImage}, RestartRequired: true}}},
+					{Containers: []appspub.InPlaceUpdatePlanContainer{{Name: "c2", Changes: []string{appspub.InPlaceUpdateChangeImage}, RestartRequired: true}}},
+				},
+			})
+			pod.Annotations[appspub.InPlaceUpdatePlanKey] = originalPlan
+			planSnapshot := &appspub.InPlaceUpdatePlan{}
+			if err := json.Unmarshal([]byte(originalPlan), planSnapshot); err != nil {
+				t.Fatal(err)
+			}
+			updateState := appspub.InPlaceUpdateState{
+				Revision: "original", UpdateTimestamp: metav1.Now(), UpdateImages: true, UpdatePlan: planSnapshot,
+				LastContainerStatuses: map[string]appspub.InPlaceUpdateContainerStatus{"c1": {ImageID: "old-image-id"}},
+				NextContainerImages:   map[string]string{"c2": "foo2"},
+			}
+			if grace {
+				updateState.NextContainerImages = nil
+				pod.Annotations[appspub.InPlaceUpdateGraceKey] = util.DumpJSON(inplaceupdate.UpdateSpec{Revision: "original", GraceSeconds: 3600, ContainerImages: map[string]string{"c1": "foo2", "c2": "foo2"}})
+			} else {
+				pod.Spec.Containers[0].Image = "foo2"
+			}
+			originalState := util.DumpJSON(updateState)
+			originalGrace := pod.Annotations[appspub.InPlaceUpdateGraceKey]
+			pod.Annotations[appspub.InPlaceUpdateStateKey] = originalState
+			client := fake.NewSimpleClientset(pod)
+			control := &defaultStatefulSetControl{
+				inplaceControl:   inplaceupdate.NewForTypedClient(client, revisionadapter.NewDefaultImpl()),
+				lifecycleControl: lifecycle.NewForTypedClient(client),
+			}
+			prepared, err := inplaceupdate.PrepareUpdate(pod, originalRevision, newRevision, &inplaceupdate.UpdateOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			hook := &appspub.LifecycleHook{FinalizersHandler: []string{"approval"}}
+			updated, pod, err := inplaceupdate.SyncUpdatePlan(pod, prepared, hook, control.lifecycleControl)
+			if err != nil || !updated || lifecycle.GetPodLifecycleState(pod) != appspub.LifecycleStatePreparingUpdate {
+				t.Fatalf("expected suspension for new target, updated=%v err=%v", updated, err)
+			}
+			if updated, _, err := control.refreshPodState(&appsv1beta1.StatefulSet{}, pod, originalRevision.Name); err != nil || !updated {
+				t.Fatalf("expected original cycle resumed after cancellation, updated=%v err=%v", updated, err)
+			}
+			gotPod, err := client.CoreV1().Pods(pod.Namespace).Get(context.TODO(), pod.Name, metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if lifecycle.GetPodLifecycleState(gotPod) != appspub.LifecycleStateUpdating || gotPod.Annotations[appspub.InPlaceUpdatePlanKey] != originalPlan ||
+				gotPod.Annotations[appspub.InPlaceUpdateStateKey] != originalState || gotPod.Annotations[appspub.InPlaceUpdateGraceKey] != originalGrace {
+				t.Fatalf("expected full original plan and unchanged pending/grace execution: %s", util.DumpJSON(gotPod))
+			}
+			if grace {
+				updateState.UpdateTimestamp = metav1.NewTime(time.Now().Add(-2 * time.Hour))
+				gotPod.Annotations[appspub.InPlaceUpdateStateKey] = util.DumpJSON(updateState)
+			} else {
+				gotPod.Status.ContainerStatuses[0].ImageID = "new-image-id"
+			}
+			if gotPod, err = client.CoreV1().Pods(gotPod.Namespace).Update(context.TODO(), gotPod, metav1.UpdateOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := control.refreshPodState(&appsv1beta1.StatefulSet{}, gotPod, originalRevision.Name); err != nil {
+				t.Fatal(err)
+			}
+			if gotPod, err = client.CoreV1().Pods(gotPod.Namespace).Get(context.TODO(), gotPod.Name, metav1.GetOptions{}); err != nil {
+				t.Fatal(err)
+			}
+			if gotPod.Spec.Containers[1].Image != "foo2" || gotPod.Annotations[appspub.InPlaceUpdatePlanKey] != originalPlan {
+				t.Fatalf("resumed cycle must execute original pending/grace work under its original full plan: %s", util.DumpJSON(gotPod))
+			}
+		})
+	}
+}
+
+func TestStatefulSetIncompleteUpdatePlanRetained(t *testing.T) {
+	for _, state := range []appspub.LifecycleStateType{"", appspub.LifecycleStateNormal, appspub.LifecycleStatePreparingUpdate} {
+		for _, grace := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/grace=%v", state, grace), func(t *testing.T) {
+				pod := &v1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "pod-plan", Namespace: "test", UID: "pod-plan-uid", ResourceVersion: "1",
+						Labels:      map[string]string{apps.StatefulSetRevisionLabel: "target", appspub.LifecycleStateKey: string(state)},
+						Annotations: map[string]string{appspub.InPlaceUpdatePlanKey: `{"planID":"active","batches":[]}`},
+					},
+					Spec:   v1.PodSpec{Containers: []v1.Container{{Name: "c1", Image: "foo1"}}},
+					Status: v1.PodStatus{ContainerStatuses: []v1.ContainerStatus{{Name: "c1", ImageID: "old-image-id"}}},
+				}
+				updateState := appspub.InPlaceUpdateState{
+					Revision: "target", UpdateTimestamp: metav1.Now(), UpdateImages: true,
+					UpdatePlan:            &appspub.InPlaceUpdatePlan{PlanID: "active", Batches: []appspub.InPlaceUpdatePlanBatch{}},
+					LastContainerStatuses: map[string]appspub.InPlaceUpdateContainerStatus{"c1": {ImageID: "old-image-id"}},
+					NextContainerImages:   map[string]string{"c1": "foo2"},
+				}
+				if grace {
+					updateState.NextContainerImages = nil
+					pod.Annotations[appspub.InPlaceUpdateGraceKey] = util.DumpJSON(inplaceupdate.UpdateSpec{Revision: "target", GraceSeconds: 3600})
+				}
+				pod.Annotations[appspub.InPlaceUpdateStateKey] = util.DumpJSON(updateState)
+				client := fake.NewSimpleClientset(pod)
+				control := &defaultStatefulSetControl{
+					inplaceControl:   inplaceupdate.NewForTypedClient(client, revisionadapter.NewDefaultImpl()),
+					lifecycleControl: lifecycle.NewForTypedClient(client),
+				}
+				expectedState := state
+				resume := state == appspub.LifecycleStatePreparingUpdate
+				if resume {
+					expectedState = appspub.LifecycleStateUpdating
+				}
+				if updated, _, err := control.refreshPodState(&appsv1beta1.StatefulSet{}, pod, "target"); err != nil || updated != resume {
+					t.Fatalf("incomplete update must preserve or resume original plan, updated=%v err=%v", updated, err)
+				}
+				gotPod, err := client.CoreV1().Pods(pod.Namespace).Get(context.TODO(), pod.Name, metav1.GetOptions{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if gotPod.Annotations[appspub.InPlaceUpdatePlanKey] == "" || lifecycle.GetPodLifecycleState(gotPod) != expectedState {
+					t.Fatalf("expected active plan retained or restored: %s", util.DumpJSON(gotPod))
+				}
+			})
+		}
+	}
+}
+
 func TestStatefulSetControlLifecycleHook(t *testing.T) {
 	set := burst(newStatefulSet(3))
 	var partition int32 = 2
@@ -2602,6 +2781,18 @@ func TestStatefulSetControlLifecycleHook(t *testing.T) {
 	if lifecycle.GetPodLifecycleState(pods[2]) != appspub.LifecycleStatePreparingUpdate {
 		t.Fatalf("Expected pod2 in state %v, actually in state %v", appspub.LifecycleStatePreparingUpdate, lifecycle.GetPodLifecycleState(pods[2]))
 	}
+	approvedPlan := pods[2].Annotations[appspub.InPlaceUpdatePlanKey]
+	plan := &appspub.InPlaceUpdatePlan{}
+	if err := json.Unmarshal([]byte(approvedPlan), plan); err != nil {
+		t.Fatal(err)
+	}
+	if plan.PlanID == "" || len(plan.Batches) != 1 || len(plan.Batches[0].Containers) != 1 {
+		t.Fatalf("expected full plan before hook release, got %+v", plan)
+	}
+	entry := plan.Batches[0].Containers[0]
+	if entry.Name != "nginx" || !entry.RestartRequired || !reflect.DeepEqual(entry.Changes, []string{appspub.InPlaceUpdateChangeImage}) {
+		t.Fatalf("unexpected image update plan: %+v", entry)
+	}
 
 	// update pod2 label to be not hooked
 	pods[2].Labels["unready-block"] = "false"
@@ -2642,6 +2833,9 @@ func TestStatefulSetControlLifecycleHook(t *testing.T) {
 	if lifecycle.GetPodLifecycleState(pods[2]) != appspub.LifecycleStateUpdated {
 		t.Fatalf("Expected pod2 in state %v, actually in state %v", appspub.LifecycleStateUpdated, lifecycle.GetPodLifecycleState(pods[2]))
 	}
+	if pods[2].Annotations[appspub.InPlaceUpdatePlanKey] != approvedPlan {
+		t.Fatal("expected original approved plan to remain available for the post-update hook")
+	}
 
 	// update pod2 to be hooked, pod2 state to Normal
 	pods[2].Labels["unready-block"] = "true"
@@ -2656,6 +2850,9 @@ func TestStatefulSetControlLifecycleHook(t *testing.T) {
 
 	if lifecycle.GetPodLifecycleState(pods[2]) != appspub.LifecycleStateNormal {
 		t.Fatalf("Expected pod2 in state %v, actually in state %v", appspub.LifecycleStateNormal, lifecycle.GetPodLifecycleState(pods[2]))
+	}
+	if _, exists := pods[2].Annotations[appspub.InPlaceUpdatePlanKey]; exists {
+		t.Fatal("expected plan removal in the same transition to Normal")
 	}
 
 	// should not prepare in-place update pod 1
@@ -3159,7 +3356,7 @@ func TestUpdateWithLifecycleHook(t *testing.T) {
 			},
 		},
 		{
-			name: "in-place update: preparingUpdate->Updating, InPlaceUpdate does not hook",
+			name: "in-place update: preparingUpdate repairs missing plan and rearms hook",
 			set: &appsv1beta1.StatefulSet{
 				ObjectMeta: metav1.ObjectMeta{Name: "sts", Namespace: testNs},
 				Spec: appsv1beta1.StatefulSetSpec{
@@ -3215,32 +3412,22 @@ func TestUpdateWithLifecycleHook(t *testing.T) {
 						Name:      "sts-0",
 						Namespace: testNs,
 						Labels: map[string]string{
-							"apps.kubernetes.io/pod-index":       "0",
-							"statefulset.kubernetes.io/pod-name": "sts-0",
 							"test":                               "asts",
-							apps.ControllerRevisionHashLabelKey:  "rev_new",
+							apps.ControllerRevisionHashLabelKey:  "rev_old",
 							apps.DefaultDeploymentUniqueLabelKey: "rev_old",
-							appspub.LifecycleStateKey:            string(appspub.LifecycleStateUpdating),
+							appspub.LifecycleStateKey:            string(appspub.LifecycleStatePreparingUpdate),
 						},
-						Annotations: map[string]string{
-							appspub.InPlaceUpdateStateKey: util.DumpJSON(appspub.InPlaceUpdateState{
-								Revision:               "rev_new",
-								UpdateTimestamp:        metav1.NewTime(now.Time),
-								LastContainerStatuses:  map[string]appspub.InPlaceUpdateContainerStatus{"c1": {ImageID: "image-id-xyz"}},
-								UpdateImages:           true,
-								ContainerBatchesRecord: []appspub.InPlaceUpdateContainerBatch{{Timestamp: now, Containers: []string{"c1"}}},
-							}),
-						},
-						UID: "sts-0-uid",
+						Finalizers: []string{"slb/online"},
+						UID:        "sts-0-uid",
 					},
 					Spec: v1.PodSpec{
 						ReadinessGates: []v1.PodReadinessGate{{ConditionType: appspub.InPlaceUpdateReady}},
-						Containers:     []v1.Container{{Name: "c1", Image: "foo2"}},
+						Containers:     []v1.Container{{Name: "c1", Image: "foo1"}},
 					},
 					Status: v1.PodStatus{
 						Phase: v1.PodRunning, Conditions: []v1.PodCondition{
 							{Type: v1.PodReady, Status: v1.ConditionTrue},
-							{Type: appspub.InPlaceUpdateReady, Status: v1.ConditionFalse, Reason: "StartInPlaceUpdate", LastTransitionTime: now},
+							{Type: appspub.InPlaceUpdateReady, Status: v1.ConditionTrue},
 						},
 						ContainerStatuses: []v1.ContainerStatus{{Name: "c1", ImageID: "image-id-xyz"}},
 					},
@@ -3425,7 +3612,47 @@ func TestUpdateWithLifecycleHook(t *testing.T) {
 				err := spc.objectMgr.CreatePod(context.TODO(), po)
 				assert.Nil(t, err)
 			}
-
+			for _, expectedPod := range mc.expectedPods {
+				for _, sourcePod := range mc.pods {
+					if sourcePod.Name != expectedPod.Name || (lifecycle.GetPodLifecycleState(expectedPod) != appspub.LifecycleStatePreparingUpdate &&
+						(getPodRevision(expectedPod) != mc.updateRevision.Name || getPodRevision(sourcePod) == mc.updateRevision.Name)) {
+						continue
+					}
+					var oldRevision *apps.ControllerRevision
+					for _, revision := range mc.revisions {
+						if getPodRevision(sourcePod) == revision.Name {
+							oldRevision = revision
+							break
+						}
+					}
+					opts := &inplaceupdate.UpdateOptions{}
+					if rolling := mc.set.Spec.UpdateStrategy.RollingUpdate; rolling != nil && rolling.InPlaceUpdateStrategy != nil {
+						opts.GracePeriodSeconds = rolling.InPlaceUpdateStrategy.GracePeriodSeconds
+					}
+					prepared, err := inplaceupdate.PrepareUpdate(sourcePod, oldRevision, mc.updateRevision, opts)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if prepared != nil {
+						plan, err := json.Marshal(prepared.Plan)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if expectedPod.Annotations == nil {
+							expectedPod.Annotations = map[string]string{}
+						}
+						expectedPod.Annotations[appspub.InPlaceUpdatePlanKey] = string(plan)
+						if raw, exists := appspub.GetInPlaceUpdateState(expectedPod); exists {
+							state := &appspub.InPlaceUpdateState{}
+							if err := json.Unmarshal([]byte(raw), state); err != nil {
+								t.Fatal(err)
+							}
+							state.UpdatePlan = prepared.Plan
+							expectedPod.Annotations[appspub.InPlaceUpdateStateKey] = util.DumpJSON(state)
+						}
+					}
+				}
+			}
 			currentRevision := mc.updateRevision
 			if len(mc.revisions) > 0 {
 				currentRevision = mc.revisions[0]

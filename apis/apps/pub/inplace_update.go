@@ -33,6 +33,11 @@ const (
 	// InPlaceUpdateStateKey records the state of inplace-update.
 	// The value of annotation is InPlaceUpdateState.
 	InPlaceUpdateStateKey string = "apps.kruise.io/inplace-update-state"
+
+	// InPlaceUpdatePlanKey describes the full update before the lifecycle hook is released.
+	// The plan remains unchanged during execution; progress is recorded in InPlaceUpdateState.
+	InPlaceUpdatePlanKey = "apps.kruise.io/inplace-update-plan"
+
 	// TODO: will be removed since v1.0.0
 	InPlaceUpdateStateKeyOld string = "inplace-update-state"
 
@@ -47,10 +52,42 @@ const (
 	RuntimeContainerMetaKey = "apps.kruise.io/runtime-containers-meta"
 )
 
+// InPlaceUpdatePlan describes a single update cycle, approved through the existing lifecycle hook.
+// Batch order is significant; container order within a batch does not imply serial execution.
+type InPlaceUpdatePlan struct {
+	PlanID  string                   `json:"planID"`
+	Batches []InPlaceUpdatePlanBatch `json:"batches"`
+}
+
+type InPlaceUpdatePlanBatch struct {
+	Containers []InPlaceUpdatePlanContainer `json:"containers"`
+}
+
+type InPlaceUpdatePlanContainer struct {
+	Name            string   `json:"name"`
+	RestartRequired bool     `json:"restartRequired"`
+	Changes         []string `json:"changes"`
+}
+
+const (
+	InPlaceUpdateChangeImage       = "Image"
+	InPlaceUpdateChangeResources   = "Resources"
+	InPlaceUpdateChangeMetadataEnv = "MetadataEnv"
+)
+
+func RemoveInPlaceUpdatePlan(pod *v1.Pod) {
+	if pod != nil {
+		delete(pod.Annotations, InPlaceUpdatePlanKey)
+	}
+}
+
 // InPlaceUpdateState records latest inplace-update state, including old statuses of containers.
 type InPlaceUpdateState struct {
 	// Revision is the updated revision hash.
 	Revision string `json:"revision"`
+
+	// UpdatePlan preserves the approved cycle when a replacement plan is awaiting approval.
+	UpdatePlan *InPlaceUpdatePlan `json:"updatePlan,omitempty"`
 
 	// UpdateTimestamp is the start time when the in-place update happens.
 	UpdateTimestamp metav1.Time `json:"updateTimestamp"`

@@ -37,7 +37,6 @@ import (
 	"github.com/openkruise/kruise/pkg/client"
 	"github.com/openkruise/kruise/pkg/features"
 	"github.com/openkruise/kruise/pkg/util"
-	utilcontainerlaunchpriority "github.com/openkruise/kruise/pkg/util/containerlaunchpriority"
 	utilcontainermeta "github.com/openkruise/kruise/pkg/util/containermeta"
 	utilfeature "github.com/openkruise/kruise/pkg/util/feature"
 	"github.com/openkruise/kruise/pkg/util/volumeclaimtemplate"
@@ -77,6 +76,9 @@ func SetOptionsDefaults(opts *UpdateOptions) *UpdateOptions {
 func defaultPatchUpdateSpecToPod(pod *v1.Pod, spec *UpdateSpec, state *appspub.InPlaceUpdateState) (*v1.Pod, map[string]*v1.ResourceRequirements, error) {
 	klog.V(5).InfoS("Begin to in-place update pod", "namespace", pod.Namespace, "name", pod.Name, "spec", util.DumpJSON(spec), "state", util.DumpJSON(state))
 
+	if err := validatePlannedMetadataPatch(pod, spec); err != nil {
+		return nil, nil, err
+	}
 	state.NextContainerImages = make(map[string]string)
 	state.NextInitContainerImages = make(map[string]string)
 	state.NextContainerRefMetadata = make(map[string]metav1.ObjectMeta)
@@ -101,51 +103,7 @@ func defaultPatchUpdateSpecToPod(pod *v1.Pod, spec *UpdateSpec, state *appspub.I
 		pod.Annotations = make(map[string]string)
 	}
 
-	// prepare containers that should update this time and next time, according to their priorities
-	containersToUpdate := sets.NewString()
-	var highestPriority *int
-	var containersWithHighestPriority []string
-	for i := range pod.Spec.Containers {
-		c := &pod.Spec.Containers[i]
-		_, existImage := spec.ContainerImages[c.Name]
-		_, existMetadata := spec.ContainerRefMetadata[c.Name]
-		_, existResource := spec.ContainerResources[c.Name]
-		if !existImage && !existMetadata && !existResource {
-			continue
-		}
-		priority := utilcontainerlaunchpriority.GetContainerPriority(c)
-		if priority == nil {
-			containersToUpdate.Insert(c.Name)
-		} else if highestPriority == nil || *highestPriority < *priority {
-			highestPriority = priority
-			containersWithHighestPriority = []string{c.Name}
-		} else if *highestPriority == *priority {
-			containersWithHighestPriority = append(containersWithHighestPriority, c.Name)
-		}
-	}
-	for _, cName := range containersWithHighestPriority {
-		containersToUpdate.Insert(cName)
-	}
-	// Native sidecars precede ordinary containers, in init container spec order. Only changed
-	// sidecars are selected; unchanged init containers do not create extra update batches.
-	initContainersToUpdate := sets.NewString()
-	for i := range pod.Spec.InitContainers {
-		c := &pod.Spec.InitContainers[i]
-		if !util.IsRestartableInitContainer(c) {
-			continue
-		}
-		_, existsImage := spec.InitContainerImages[c.Name]
-		_, existsResource := spec.ContainerResources[c.Name]
-		if !existsImage && !existsResource {
-			continue
-		}
-		initContainersToUpdate.Insert(c.Name)
-		containersToUpdate = sets.NewString(c.Name)
-		break
-	}
-	if initContainersToUpdate.Len() == 0 {
-		addMetadataSharedContainersToUpdate(pod, containersToUpdate, spec.ContainerRefMetadata)
-	}
+	containersToUpdate, initContainersToUpdate := selectNextUpdateBatch(pod, spec)
 
 	// DO NOT modify the fields in spec for it may have to retry on conflict in updatePodInPlace
 
@@ -542,6 +500,10 @@ func defaultCalculateInPlaceUpdateSpec(oldRevision, newRevision *apps.Controller
 		oldBytes, _ := json.Marshal(v1.Pod{ObjectMeta: oldTemp.ObjectMeta})
 		newBytes, _ := json.Marshal(v1.Pod{ObjectMeta: newTemp.ObjectMeta})
 		patchBytes, err := strategicpatch.CreateTwoWayMergePatch(oldBytes, newBytes, &v1.Pod{})
+		if err != nil {
+			return nil
+		}
+		patchBytes, err = normalizeTemplateMetadataPatch(oldTemp.ObjectMeta, patchBytes)
 		if err != nil {
 			return nil
 		}

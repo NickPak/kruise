@@ -18,6 +18,7 @@ package podreadiness
 
 import (
 	"encoding/json"
+	"fmt"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -41,6 +42,9 @@ func addNotReadyKey(adp podadapter.Adapter, pod *v1.Pod, msg Message, condType v
 		newPod, err := adp.GetPod(pod.Namespace, pod.Name)
 		if err != nil {
 			return err
+		}
+		if pod.UID != "" && newPod.UID != pod.UID {
+			return fmt.Errorf("Pod UID changed before readiness update")
 		}
 
 		condition := getReadinessCondition(newPod, condType)
@@ -77,6 +81,9 @@ func removeNotReadyKey(adp podadapter.Adapter, pod *v1.Pod, msg Message, condTyp
 		newPod, err := adp.GetPod(pod.Namespace, pod.Name)
 		if err != nil {
 			return err
+		}
+		if pod.UID != "" && newPod.UID != pod.UID {
+			return fmt.Errorf("Pod UID changed before readiness update")
 		}
 
 		condition := getReadinessCondition(newPod, condType)
