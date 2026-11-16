@@ -18,6 +18,7 @@ package inplaceupdate
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"testing"
@@ -25,16 +26,21 @@ import (
 
 	apps "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	testingclock "k8s.io/utils/clock/testing"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	appspub "github.com/openkruise/kruise/apis/apps/pub"
+	utilclient "github.com/openkruise/kruise/pkg/client"
 	"github.com/openkruise/kruise/pkg/features"
 	"github.com/openkruise/kruise/pkg/util"
+	utilcontainerlaunchpriority "github.com/openkruise/kruise/pkg/util/containerlaunchpriority"
 	utilfeature "github.com/openkruise/kruise/pkg/util/feature"
+	"github.com/openkruise/kruise/pkg/util/podadapter"
 	"github.com/openkruise/kruise/pkg/util/revisionadapter"
 )
 
@@ -646,5 +652,186 @@ func TestRefresh(t *testing.T) {
 		if !reflect.DeepEqual(testCase.expectedPod, got) {
 			t.Fatalf("case %s failed, expected \n%v\n got \n%v", testCase.name, util.DumpJSON(testCase.expectedPod), util.DumpJSON(got))
 		}
+	}
+}
+
+// resourceBatchTestAdapter emulates the resize subresource using a normal fake-client patch.
+// Kubelet resource-status updates are simulated separately by the test.
+type resourceBatchTestAdapter struct {
+	*podadapter.AdapterRuntimeClient
+	resizePatches int
+}
+
+func (a *resourceBatchTestAdapter) PatchPodResource(pod *v1.Pod, patch client.Patch) (*v1.Pod, error) {
+	a.resizePatches++
+	return a.PatchPod(pod, patch)
+}
+
+func TestRefreshResourceOnlyNextBatch(t *testing.T) {
+	defer utilfeature.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlaceWorkloadVerticalScaling, true)()
+
+	for _, gitVersion := range []string{"v1.31.0", "v1.35.2"} {
+		t.Run(gitVersion, func(t *testing.T) {
+			serverVersion := utilclient.GetCurrentServerVersion()
+			originalVersion := *serverVersion
+			serverVersion.GitVersion = gitVersion
+			t.Cleanup(func() { *serverVersion = originalVersion })
+
+			for _, tc := range []struct {
+				name         string
+				imageUpdated bool
+				ready        bool
+			}{
+				{name: "previous image not updated", ready: true},
+				{name: "previous container not ready", imageUpdated: true},
+				{name: "advance resource-only batches", imageUpdated: true, ready: true},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					oldResources := v1.ResourceRequirements{
+						Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m"), v1.ResourceMemory: resource.MustParse("128Mi")},
+						Limits:   v1.ResourceList{v1.ResourceCPU: resource.MustParse("400m"), v1.ResourceMemory: resource.MustParse("512Mi")},
+					}
+					newResources := v1.ResourceRequirements{
+						Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("200m"), v1.ResourceMemory: resource.MustParse("256Mi")},
+					}
+					pod := &v1.Pod{
+						ObjectMeta: metav1.ObjectMeta{Name: "resource-batch", Namespace: "default", UID: types.UID("original-pod")},
+						Spec: v1.PodSpec{
+							Containers: []v1.Container{
+								{Name: "helix", Image: "helix:v2", Resources: *oldResources.DeepCopy()},
+								{
+									Name: "meshproxy", Image: "meshproxy:v1", Resources: *oldResources.DeepCopy(),
+									Env: []v1.EnvVar{utilcontainerlaunchpriority.GeneratePriorityEnv(80, "resource-batch")},
+								},
+								{
+									Name: "reloader", Image: "reloader:v1", Resources: *oldResources.DeepCopy(),
+									Env: []v1.EnvVar{utilcontainerlaunchpriority.GeneratePriorityEnv(10, "resource-batch")},
+								},
+							},
+							ReadinessGates: []v1.PodReadinessGate{{ConditionType: appspub.InPlaceUpdateReady}},
+						},
+						Status: v1.PodStatus{
+							ContainerStatuses: []v1.ContainerStatus{
+								{Name: "helix", Image: "helix:v1", ImageID: "helix-old", Ready: tc.ready, Resources: oldResources.DeepCopy()},
+								{Name: "meshproxy", Image: "meshproxy:v1", ContainerID: "meshproxy-original", Ready: true, Resources: oldResources.DeepCopy()},
+								{Name: "reloader", Image: "reloader:v1", ContainerID: "reloader-original", Ready: true, Resources: oldResources.DeepCopy()},
+							},
+							Conditions: []v1.PodCondition{{Type: appspub.InPlaceUpdateReady, Status: v1.ConditionFalse}},
+						},
+					}
+					if tc.imageUpdated {
+						pod.Status.ContainerStatuses[0].Image = "helix:v2"
+						pod.Status.ContainerStatuses[0].ImageID = "helix-new"
+					}
+					state := appspub.InPlaceUpdateState{
+						Revision: "new-revision", UpdateImages: true, UpdateResources: true,
+						LastContainerStatuses: map[string]appspub.InPlaceUpdateContainerStatus{"helix": {ImageID: "helix-old"}},
+						NextContainerResources: map[string]v1.ResourceRequirements{
+							"meshproxy": newResources, "reloader": newResources,
+						},
+						PreCheckBeforeNext:     &appspub.InPlaceUpdatePreCheckBeforeNext{ContainersRequiredReady: []string{"helix"}},
+						ContainerBatchesRecord: []appspub.InPlaceUpdateContainerBatch{{Containers: []string{"helix"}}},
+					}
+					pod.Annotations = map[string]string{appspub.InPlaceUpdateStateKey: util.DumpJSON(state)}
+					cli := fake.NewClientBuilder().WithStatusSubresource(&v1.Pod{}).WithObjects(pod).Build()
+					adapter := &resourceBatchTestAdapter{AdapterRuntimeClient: &podadapter.AdapterRuntimeClient{Client: cli}}
+					ctrl := New(cli, revisionadapter.NewDefaultImpl()).(*realControl)
+					ctrl.podAdapter = adapter
+
+					refresh := func() *v1.Pod {
+						t.Helper()
+						current := &v1.Pod{}
+						key := types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}
+						if err := cli.Get(context.TODO(), key, current); err != nil {
+							t.Fatal(err)
+						}
+						if res := ctrl.Refresh(current, nil); res.RefreshErr != nil {
+							t.Fatalf("failed to refresh: %v", res.RefreshErr)
+						}
+						if err := cli.Get(context.TODO(), key, current); err != nil {
+							t.Fatal(err)
+						}
+						return current
+					}
+					readState := func(current *v1.Pod) appspub.InPlaceUpdateState {
+						t.Helper()
+						var got appspub.InPlaceUpdateState
+						if err := json.Unmarshal([]byte(current.Annotations[appspub.InPlaceUpdateStateKey]), &got); err != nil {
+							t.Fatal(err)
+						}
+						return got
+					}
+
+					got := refresh()
+					if !tc.imageUpdated || !tc.ready {
+						if !reflect.DeepEqual(got.Spec.Containers, pod.Spec.Containers) || adapter.resizePatches != 0 ||
+							len(readState(got).ContainerBatchesRecord) != 1 {
+							t.Fatal("resource batches advanced before the previous container completed and became ready")
+						}
+						return
+					}
+					if !got.Spec.Containers[1].Resources.Requests.Cpu().Equal(resource.MustParse("200m")) ||
+						!got.Spec.Containers[1].Resources.Requests.Memory().Equal(resource.MustParse("256Mi")) {
+						t.Fatalf("resource-only next batch did not update meshproxy: %+v", got.Spec.Containers[1].Resources)
+					}
+					if !reflect.DeepEqual(got.Spec.Containers[2].Resources, oldResources) {
+						t.Fatal("lower-priority reloader resized before meshproxy completed")
+					}
+					state = readState(got)
+					if len(state.NextContainerResources) != 1 || len(state.ContainerBatchesRecord) != 2 ||
+						!reflect.DeepEqual(state.ContainerBatchesRecord[1].Containers, []string{"meshproxy"}) {
+						t.Fatalf("unexpected intermediate batch state: %+v", state)
+					}
+
+					waiting := refresh()
+					if len(readState(waiting).ContainerBatchesRecord) != 2 {
+						t.Fatal("next resource batch advanced before kubelet reported resize completion")
+					}
+					waiting.Status.ContainerStatuses[1].Resources = waiting.Spec.Containers[1].Resources.DeepCopy()
+					if err := cli.Status().Update(context.TODO(), waiting); err != nil {
+						t.Fatal(err)
+					}
+					got = refresh()
+					if !got.Spec.Containers[2].Resources.Requests.Cpu().Equal(resource.MustParse("200m")) {
+						t.Fatalf("second resource-only batch did not update reloader: %+v", got.Spec.Containers[2].Resources)
+					}
+					state = readState(got)
+					if len(state.NextContainerResources) != 0 || state.PreCheckBeforeNext != nil || len(state.ContainerBatchesRecord) != 3 {
+						t.Fatalf("pending resource batches were not cleared: %+v", state)
+					}
+					if err := DefaultCheckInPlaceUpdateCompleted(got); err == nil {
+						t.Fatal("update completed before kubelet reported the last resize")
+					}
+					got.Status.ContainerStatuses[2].Resources = got.Spec.Containers[2].Resources.DeepCopy()
+					if err := cli.Status().Update(context.TODO(), got); err != nil {
+						t.Fatal(err)
+					}
+					got = refresh()
+					if err := DefaultCheckInPlaceUpdateCompleted(got); err != nil {
+						t.Fatalf("update remained incomplete after all resource batches: %v", err)
+					}
+					if got.Status.Conditions[0].Status != v1.ConditionTrue {
+						t.Fatal("InPlaceUpdateReady was not restored")
+					}
+					for i := 1; i < len(got.Spec.Containers); i++ {
+						if got.Spec.Containers[i].Image != pod.Spec.Containers[i].Image ||
+							!reflect.DeepEqual(got.Spec.Containers[i].Resources.Limits, oldResources.Limits) ||
+							got.Status.ContainerStatuses[i].ContainerID != pod.Status.ContainerStatuses[i].ContainerID ||
+							got.Status.ContainerStatuses[i].RestartCount != 0 {
+							t.Fatal("resource-only batch changed an image, limit or container identity")
+						}
+					}
+					if got.UID != pod.UID {
+						t.Fatal("resource-only update changed Pod identity")
+					}
+					if gitVersion == "v1.35.2" && adapter.resizePatches != 2 {
+						t.Fatalf("expected two resize-subresource patches, got %d", adapter.resizePatches)
+					}
+					if gitVersion == "v1.31.0" && adapter.resizePatches != 0 {
+						t.Fatalf("legacy update unexpectedly used resize subresource: %d", adapter.resizePatches)
+					}
+				})
+			}
+		})
 	}
 }
