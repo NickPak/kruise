@@ -1077,18 +1077,18 @@ func TestUpdate(t *testing.T) {
 	}
 }
 
-func newCloneSetUpdatePlanTest(t *testing.T, image, cpu string) (*realControl, *appsv1beta1.CloneSet, *v1.Pod, *apps.ControllerRevision, *apps.ControllerRevision) {
+func newCloneSetUpdatePlanTest(t *testing.T, image, cpu string) (*realControl, *appsv1alpha1.CloneSet, *v1.Pod, *apps.ControllerRevision, *apps.ControllerRevision) {
 	t.Helper()
-	cs := &appsv1beta1.CloneSet{
+	cs := &appsv1alpha1.CloneSet{
 		ObjectMeta: metav1.ObjectMeta{Name: "plan-test"},
-		Spec: appsv1beta1.CloneSetSpec{
+		Spec: appsv1alpha1.CloneSetSpec{
 			Replicas: getInt32Pointer(1),
 			Lifecycle: &appspub.Lifecycle{InPlaceUpdate: &appspub.LifecycleHook{
 				FinalizersHandler: []string{"approval"},
 			}},
-			UpdateStrategy: appsv1beta1.CloneSetUpdateStrategy{RollingUpdate: &appsv1beta1.RollingUpdateCloneSetStrategy{
-				PodUpdatePolicy: appsv1beta1.InPlaceIfPossibleCloneSetPodUpdateStrategyType,
-			}},
+			UpdateStrategy: appsv1alpha1.CloneSetUpdateStrategy{
+				Type: appsv1alpha1.InPlaceIfPossibleCloneSetUpdateStrategyType,
+			},
 		},
 	}
 	pod := &v1.Pod{
@@ -1215,7 +1215,7 @@ func TestCloneSetCancelledUpdatePlanResumesOriginalCycle(t *testing.T) {
 		t.Run(fmt.Sprintf("grace=%v", grace), func(t *testing.T) {
 			control, cs, pod, oldRevision, newRevision := newCloneSetUpdatePlanTest(t, "foo2", "100m")
 			if grace {
-				cs.Spec.UpdateStrategy.RollingUpdate.InPlaceUpdateStrategy = &appspub.InPlaceUpdateStrategy{GracePeriodSeconds: 3600}
+				cs.Spec.UpdateStrategy.InPlaceUpdateStrategy = &appspub.InPlaceUpdateStrategy{GracePeriodSeconds: 3600}
 			}
 			if _, err := control.updatePod(cs, clonesetcore.New(cs), newRevision, []*apps.ControllerRevision{oldRevision}, pod, nil); err != nil {
 				t.Fatal(err)
@@ -1346,7 +1346,7 @@ func TestCloneSetUpdatePlanPreservedWhileIncomplete(t *testing.T) {
 
 func TestCloneSetUpdatePlanClearedBeforeRecreate(t *testing.T) {
 	control, cs, pod, oldRevision, newRevision := newCloneSetUpdatePlanTest(t, "foo2", "100m")
-	cs.Spec.UpdateStrategy.RollingUpdate.PodUpdatePolicy = appsv1beta1.RecreateCloneSetPodUpdateStrategyType
+	cs.Spec.UpdateStrategy.Type = appsv1alpha1.RecreateCloneSetUpdateStrategyType
 	pod.Annotations = map[string]string{appspub.InPlaceUpdatePlanKey: `{"planID":"obsolete","batches":[]}`}
 	if err := control.Client.Update(context.TODO(), pod); err != nil {
 		t.Fatal(err)
@@ -1357,7 +1357,7 @@ func TestCloneSetUpdatePlanClearedBeforeRecreate(t *testing.T) {
 	if err := control.Get(context.TODO(), client.ObjectKeyFromObject(pod), pod); err != nil {
 		t.Fatal(err)
 	}
-	if _, exists := pod.Annotations[appspub.InPlaceUpdatePlanKey]; exists || pod.Labels[appsv1beta1.SpecifiedDeleteKey] != "" {
+	if _, exists := pod.Annotations[appspub.InPlaceUpdatePlanKey]; exists || pod.Labels[appsv1alpha1.SpecifiedDeleteKey] != "" {
 		t.Fatalf("expected only plan cleanup before recreation: %s", util.DumpJSON(pod))
 	}
 	if _, err := control.updatePod(cs, clonesetcore.New(cs), newRevision, []*apps.ControllerRevision{oldRevision}, pod, nil); err != nil {
@@ -1366,7 +1366,7 @@ func TestCloneSetUpdatePlanClearedBeforeRecreate(t *testing.T) {
 	if err := control.Get(context.TODO(), client.ObjectKeyFromObject(pod), pod); err != nil {
 		t.Fatal(err)
 	}
-	if pod.Labels[appsv1beta1.SpecifiedDeleteKey] != "true" {
+	if pod.Labels[appsv1alpha1.SpecifiedDeleteKey] != "true" {
 		t.Fatalf("expected recreation after observing plan removal: %s", util.DumpJSON(pod))
 	}
 }
