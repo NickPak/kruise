@@ -163,8 +163,9 @@ const (
 	// Images can always be in-place updated when this gate is enabled. CPU and memory resources
 	// additionally require InPlaceWorkloadVerticalScaling and Kubernetes support for resizing native
 	// sidecar containers. Any other change under spec.initContainers still falls back to recreating
-	// the Pod. Restartable init containers do not participate in container launch priority batching;
-	// they are always updated in the current batch.
+	// the Pod. Changed restartable init containers are updated sequentially in spec order before
+	// ordinary containers. Each sidecar must finish updating and become Started (not Ready) before
+	// the next batch proceeds. Ordinary containers retain their launch-priority and Ready semantics.
 	//
 	// When this feature is disabled, changing any field under spec.initContainers falls back to
 	// recreating the Pod, which is the behavior before this feature was introduced.

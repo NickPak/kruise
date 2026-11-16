@@ -163,7 +163,8 @@ func (c *realControl) Refresh(pod *v1.Pod, opts *UpdateOptions) RefreshResult {
 		}
 
 		// check if there are containers with lower-priority that have to in-place update in next batch
-		if len(state.NextContainerImages) > 0 || len(state.NextContainerRefMetadata) > 0 || len(state.NextContainerResources) > 0 {
+		if len(state.NextContainerImages) > 0 || len(state.NextInitContainerImages) > 0 ||
+			len(state.NextContainerRefMetadata) > 0 || len(state.NextContainerResources) > 0 {
 
 			// pre-check the previous updated containers
 			if checkErr := doPreCheckBeforeNext(pod, state.PreCheckBeforeNext); checkErr != nil {
@@ -284,18 +285,29 @@ func (c *realControl) updateNextBatch(pod *v1.Pod, opts *UpdateOptions) (bool, e
 		}
 
 		state := appspub.InPlaceUpdateState{}
-		if stateStr, ok := appspub.GetInPlaceUpdateState(pod); !ok {
+		stateStr, ok := appspub.GetInPlaceUpdateState(clone)
+		originalState, _ := appspub.GetInPlaceUpdateState(pod)
+		if !ok || stateStr != originalState {
+			// A newer update or another reconcile already changed the pending batch.
 			return nil
-		} else if err := json.Unmarshal([]byte(stateStr), &state); err != nil {
+		}
+		if err := json.Unmarshal([]byte(stateStr), &state); err != nil {
 			return err
 		}
 
-		if len(state.NextContainerImages) == 0 && len(state.NextContainerRefMetadata) == 0 && len(state.NextContainerResources) == 0 {
+		if len(state.NextContainerImages) == 0 && len(state.NextInitContainerImages) == 0 &&
+			len(state.NextContainerRefMetadata) == 0 && len(state.NextContainerResources) == 0 {
+			return nil
+		}
+		// Refresh checked completion before selecting this batch. Do not repeat that check here:
+		// a resize patch may already have succeeded before an UpdatePod conflict is retried.
+		if err := doPreCheckBeforeNext(clone, state.PreCheckBeforeNext); err != nil {
 			return nil
 		}
 
 		spec := UpdateSpec{
 			ContainerImages:       state.NextContainerImages,
+			InitContainerImages:   state.NextInitContainerImages,
 			ContainerRefMetadata:  state.NextContainerRefMetadata,
 			UpdateEnvFromMetadata: state.UpdateEnvFromMetadata,
 			ContainerResources:    state.NextContainerResources,
@@ -500,6 +512,16 @@ func doPreCheckBeforeNext(pod *v1.Pod, preCheck *appspub.InPlaceUpdatePreCheckBe
 		}
 		if !cStatus.Ready {
 			return fmt.Errorf("waiting container %s to be ready", cName)
+		}
+	}
+	return checkContainersStarted(pod, preCheck.ContainersRequiredStarted)
+}
+
+func checkContainersStarted(pod *v1.Pod, names []string) error {
+	for _, name := range names {
+		status := util.GetContainerStatusIncludingInit(name, pod)
+		if status == nil || status.Started == nil || !*status.Started {
+			return fmt.Errorf("waiting container %s to be started", name)
 		}
 	}
 	return nil

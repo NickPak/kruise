@@ -78,6 +78,7 @@ func defaultPatchUpdateSpecToPod(pod *v1.Pod, spec *UpdateSpec, state *appspub.I
 	klog.V(5).InfoS("Begin to in-place update pod", "namespace", pod.Namespace, "name", pod.Name, "spec", util.DumpJSON(spec), "state", util.DumpJSON(state))
 
 	state.NextContainerImages = make(map[string]string)
+	state.NextInitContainerImages = make(map[string]string)
 	state.NextContainerRefMetadata = make(map[string]metav1.ObjectMeta)
 	state.NextContainerResources = make(map[string]v1.ResourceRequirements)
 
@@ -125,10 +126,8 @@ func defaultPatchUpdateSpecToPod(pod *v1.Pod, spec *UpdateSpec, state *appspub.I
 	for _, cName := range containersWithHighestPriority {
 		containersToUpdate.Insert(cName)
 	}
-	// Restartable init containers (native sidecar containers) do not participate in the container
-	// launch priority batching, because the priority env is only injected into spec.containers.
-	// Image and resource updates are always applied in the current batch. They are still recorded
-	// in containersToUpdate so lower-priority containers wait for them to become ready.
+	// Native sidecars precede ordinary containers, in init container spec order. Only changed
+	// sidecars are selected; unchanged init containers do not create extra update batches.
 	initContainersToUpdate := sets.NewString()
 	for i := range pod.Spec.InitContainers {
 		c := &pod.Spec.InitContainers[i]
@@ -141,9 +140,12 @@ func defaultPatchUpdateSpecToPod(pod *v1.Pod, spec *UpdateSpec, state *appspub.I
 			continue
 		}
 		initContainersToUpdate.Insert(c.Name)
-		containersToUpdate.Insert(c.Name)
+		containersToUpdate = sets.NewString(c.Name)
+		break
 	}
-	addMetadataSharedContainersToUpdate(pod, containersToUpdate, spec.ContainerRefMetadata)
+	if initContainersToUpdate.Len() == 0 {
+		addMetadataSharedContainersToUpdate(pod, containersToUpdate, spec.ContainerRefMetadata)
+	}
 
 	// DO NOT modify the fields in spec for it may have to retry on conflict in updatePodInPlace
 
@@ -183,11 +185,15 @@ func defaultPatchUpdateSpecToPod(pod *v1.Pod, spec *UpdateSpec, state *appspub.I
 		for i := range pod.Spec.InitContainers {
 			c := &pod.Spec.InitContainers[i]
 			newImage, exists := spec.InitContainerImages[c.Name]
-			if !exists || !initContainersToUpdate.Has(c.Name) {
+			if !exists || !util.IsRestartableInitContainer(c) {
 				continue
 			}
-			pod.Spec.InitContainers[i].Image = newImage
-			initContainersImageChanged.Insert(c.Name)
+			if initContainersToUpdate.Has(c.Name) {
+				pod.Spec.InitContainers[i].Image = newImage
+				initContainersImageChanged.Insert(c.Name)
+			} else {
+				state.NextInitContainerImages[c.Name] = newImage
+			}
 		}
 		for _, c := range pod.Status.InitContainerStatuses {
 			if !initContainersImageChanged.Has(c.Name) {
@@ -267,11 +273,13 @@ func defaultPatchUpdateSpecToPod(pod *v1.Pod, spec *UpdateSpec, state *appspub.I
 		}
 	}
 
-	// add the containers that update this time into PreCheckBeforeNext, so that next containers can only
-	// start to update when these containers have updated ready
-	// TODO: currently we only support ContainersRequiredReady, not sure if we have to add ContainersPreferredReady in future
-	if len(state.NextContainerImages) > 0 || len(state.NextContainerRefMetadata) > 0 || len(state.NextContainerResources) > 0 {
-		state.PreCheckBeforeNext = &appspub.InPlaceUpdatePreCheckBeforeNext{ContainersRequiredReady: containersToUpdate.List()}
+	// Ordinary containers gate the next batch on Ready; native sidecars gate it on Started.
+	if len(state.NextContainerImages) > 0 || len(state.NextInitContainerImages) > 0 ||
+		len(state.NextContainerRefMetadata) > 0 || len(state.NextContainerResources) > 0 {
+		state.PreCheckBeforeNext = &appspub.InPlaceUpdatePreCheckBeforeNext{
+			ContainersRequiredReady:   containersToUpdate.Difference(initContainersToUpdate).List(),
+			ContainersRequiredStarted: initContainersToUpdate.List(),
+		}
 	} else {
 		state.PreCheckBeforeNext = nil
 	}
@@ -489,6 +497,15 @@ func defaultCalculateInPlaceUpdateSpec(oldRevision, newRevision *apps.Controller
 				}
 				key := rfc6901Decoder.Replace(words[3])
 
+				for i := range newTemp.Spec.InitContainers {
+					c := &newTemp.Spec.InitContainers[i]
+					if util.IsRestartableInitContainer(c) && utilcontainermeta.IsContainerReferenceToMeta(c, "metadata."+words[2], key) {
+						// Pod metadata is shared, so changing a sidecar's metadata-derived env cannot
+						// be isolated into sequential container batches. Recreate rather than restart
+						// a sidecar out of order or twice while later batches apply shared metadata.
+						return nil
+					}
+				}
 				for i := range newTemp.Spec.Containers {
 					c := &newTemp.Spec.Containers[i]
 					objMeta := updateSpec.ContainerRefMetadata[c.Name]
@@ -637,13 +654,27 @@ func DefaultCheckInPlaceUpdateCompleted(pod *v1.Pod) error {
 	} else if err := json.Unmarshal([]byte(stateStr), &inPlaceUpdateState); err != nil {
 		return err
 	}
-	if len(inPlaceUpdateState.NextContainerImages) > 0 || len(inPlaceUpdateState.NextContainerRefMetadata) > 0 || len(inPlaceUpdateState.NextContainerResources) > 0 {
+	if len(inPlaceUpdateState.NextContainerImages) > 0 || len(inPlaceUpdateState.NextInitContainerImages) > 0 ||
+		len(inPlaceUpdateState.NextContainerRefMetadata) > 0 || len(inPlaceUpdateState.NextContainerResources) > 0 {
 		return fmt.Errorf("existing containers to in-place update in next batches")
 	}
 	return defaultCheckContainersInPlaceUpdateCompleted(pod, &inPlaceUpdateState)
 }
 
 func defaultCheckContainersInPlaceUpdateCompleted(pod *v1.Pod, inPlaceUpdateState *appspub.InPlaceUpdateState) error {
+	// Check the current sidecar batch even when there is no subsequent batch. This prevents
+	// completion being reported before startupProbe succeeds, without depending on Ready.
+	if n := len(inPlaceUpdateState.ContainerBatchesRecord); n > 0 {
+		current := sets.NewString(inPlaceUpdateState.ContainerBatchesRecord[n-1].Containers...)
+		for i := range pod.Spec.InitContainers {
+			c := &pod.Spec.InitContainers[i]
+			if util.IsRestartableInitContainer(c) && current.Has(c.Name) {
+				if err := checkContainersStarted(pod, []string{c.Name}); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	runtimeContainerMetaSet, err := appspub.GetRuntimeContainerMetaSet(pod)
 	if err != nil {
 		return err
@@ -662,6 +693,44 @@ func defaultCheckContainersInPlaceUpdateCompleted(pod *v1.Pod, inPlaceUpdateStat
 	if utilfeature.DefaultFeatureGate.Enabled(features.InPlaceWorkloadVerticalScaling) && inPlaceUpdateState.UpdateResources {
 		if completed, err := verticalUpdateImpl.IsUpdateCompleted(pod, inPlaceUpdateState.CurrentInitContainerResources); !completed {
 			return err
+		}
+	}
+
+	if n := len(inPlaceUpdateState.ContainerBatchesRecord); n > 0 {
+		current := sets.NewString(inPlaceUpdateState.ContainerBatchesRecord[n-1].Containers...)
+		for i := range pod.Spec.InitContainers {
+			c := &pod.Spec.InitContainers[i]
+			if !util.IsRestartableInitContainer(c) || !current.Has(c.Name) {
+				continue
+			}
+			if _, imageChanged := inPlaceUpdateState.LastContainerStatuses[c.Name]; !imageChanged {
+				continue
+			}
+			status := util.GetContainerStatusIncludingInit(c.Name, pod)
+			if status == nil {
+				return fmt.Errorf("waiting for sidecar %s image status", c.Name)
+			}
+			runtimeVerified := false
+			if runtimeContainerMetaSet != nil {
+				for _, meta := range runtimeContainerMetaSet.Containers {
+					if meta.Name != c.Name || meta.ContainerID != status.ContainerID {
+						continue
+					}
+					if meta.Hashes.PlainHash != kubeletcontainer.HashContainer(c) && meta.Hashes.PlainHash != hashContainer(c) {
+						return fmt.Errorf("waiting for sidecar %s target image hash", c.Name)
+					}
+					runtimeVerified = true
+				}
+			}
+			if !runtimeVerified {
+				expectedImage := c.Image
+				if len(strings.Split(expectedImage, ":")) <= 1 {
+					expectedImage += ":latest"
+				}
+				if status.Image != expectedImage {
+					return fmt.Errorf("waiting for sidecar %s target image", c.Name)
+				}
+			}
 		}
 	}
 

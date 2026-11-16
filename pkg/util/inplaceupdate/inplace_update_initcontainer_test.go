@@ -17,8 +17,10 @@ limitations under the License.
 package inplaceupdate
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/appscode/jsonpatch"
@@ -27,11 +29,18 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	kubeletcontainer "k8s.io/kubernetes/pkg/kubelet/container"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	appspub "github.com/openkruise/kruise/apis/apps/pub"
+	utilclient "github.com/openkruise/kruise/pkg/client"
 	"github.com/openkruise/kruise/pkg/features"
+	utilcontainerlaunchpriority "github.com/openkruise/kruise/pkg/util/containerlaunchpriority"
 	utilfeature "github.com/openkruise/kruise/pkg/util/feature"
+	"github.com/openkruise/kruise/pkg/util/podadapter"
+	"github.com/openkruise/kruise/pkg/util/revisionadapter"
 )
 
 func restartAlways() *v1.ContainerRestartPolicy {
@@ -784,4 +793,357 @@ func TestRestartableInitContainerResourceResizePolicy(t *testing.T) {
 	if defaultCheckPodNeedsBeUnready(pod, spec) {
 		t.Fatal("regular init containers must not enter sidecar resource resize handling")
 	}
+}
+
+func TestSequentialSidecarUpdateBatches(t *testing.T) {
+	setRestartableInitResourceGates(t, true, true)
+	defer setRestartableInitResourceGates(t, false, false)
+	version := utilclient.GetCurrentServerVersion()
+	originalVersion := *version
+	version.GitVersion = "v1.35.2"
+	t.Cleanup(func() { *version = originalVersion })
+
+	cases := []struct {
+		name        string
+		sidecars    bool
+		priorities  map[string]int
+		sidecarOnly bool
+		imageOnly   bool
+		batches     [][]string
+	}{
+		{name: "ordinary unordered", batches: [][]string{{"helix", "meshproxy", "worker"}}},
+		{
+			name:       "ordinary custom priorities and default zero",
+			priorities: map[string]int{"helix": 90, "meshproxy": 80, "worker": 0},
+			batches:    [][]string{{"helix"}, {"meshproxy"}, {"worker"}},
+		},
+		{
+			name: "ordinary Ordered priorities", priorities: map[string]int{"meshproxy": 0, "helix": -1, "worker": -2},
+			batches: [][]string{{"meshproxy"}, {"helix"}, {"worker"}},
+		},
+		{
+			name: "ordinary priority mixed with missing barrier", priorities: map[string]int{"helix": 90, "meshproxy": 80},
+			batches: [][]string{{"helix", "worker"}, {"meshproxy"}},
+		},
+		{
+			name: "sidecars then unordered ordinary", sidecars: true,
+			batches: [][]string{{"z-sidecar"}, {"a-sidecar"}, {"helix", "meshproxy", "worker"}},
+		},
+		{
+			name: "sidecars then custom priorities and default zero", sidecars: true,
+			priorities: map[string]int{"helix": 90, "meshproxy": 80, "worker": 0},
+			batches:    [][]string{{"z-sidecar"}, {"a-sidecar"}, {"helix"}, {"meshproxy"}, {"worker"}},
+		},
+		{
+			name: "sidecars then missing barrier with highest priority", sidecars: true,
+			priorities: map[string]int{"helix": 90, "meshproxy": 80},
+			batches:    [][]string{{"z-sidecar"}, {"a-sidecar"}, {"helix", "worker"}, {"meshproxy"}},
+		},
+		{
+			name: "last sidecar also waits for Started", sidecars: true, sidecarOnly: true,
+			batches: [][]string{{"z-sidecar"}, {"a-sidecar"}},
+		},
+		{
+			name: "pending sidecar images without ordinary or resource updates", sidecars: true, sidecarOnly: true, imageOnly: true,
+			batches: [][]string{{"z-sidecar"}, {"a-sidecar"}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			started := true
+			oldResources := v1.ResourceRequirements{
+				Limits: initContainerTestResources("400m", "512Mi"), Requests: initContainerTestResources("100m", "128Mi"),
+			}
+			target := v1.ResourceRequirements{Requests: initContainerTestResources("200m", "256Mi")}
+			pod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "ordered-update", Namespace: "default", UID: "original-pod", Annotations: map[string]string{}},
+				Spec:       v1.PodSpec{ReadinessGates: []v1.PodReadinessGate{{ConditionType: appspub.InPlaceUpdateReady}}},
+				Status:     v1.PodStatus{Conditions: []v1.PodCondition{{Type: appspub.InPlaceUpdateReady, Status: v1.ConditionFalse}}},
+			}
+			for _, name := range []string{"meshproxy", "helix", "worker"} {
+				c := v1.Container{Name: name, Image: name + ":v1", Resources: *oldResources.DeepCopy()}
+				if priority, ok := tc.priorities[name]; ok {
+					c.Env = []v1.EnvVar{utilcontainerlaunchpriority.GeneratePriorityEnv(priority, pod.Name)}
+				}
+				pod.Spec.Containers = append(pod.Spec.Containers, c)
+				pod.Status.ContainerStatuses = append(pod.Status.ContainerStatuses, v1.ContainerStatus{
+					Name: name, Image: c.Image, ImageID: name + "-old", ContainerID: name + "-original", Ready: true, Started: &started,
+					Resources: oldResources.DeepCopy(),
+				})
+			}
+			spec := &UpdateSpec{Revision: "new-revision", ContainerResources: map[string]v1.ResourceRequirements{}}
+			if !tc.sidecarOnly {
+				spec.ContainerImages = map[string]string{"helix": "helix:v2", "worker": "worker:v2"}
+				spec.ContainerResources["meshproxy"] = target
+			}
+			if tc.sidecars {
+				// Reverse lexical names prove that sequencing follows spec order, not map order.
+				for _, name := range []string{"unchanged", "z-sidecar", "setup", "a-sidecar"} {
+					c := v1.Container{Name: name, Image: name + ":v1", Resources: *oldResources.DeepCopy(), RestartPolicy: restartAlways()}
+					if name == "setup" {
+						c.RestartPolicy = nil
+					}
+					pod.Spec.InitContainers = append(pod.Spec.InitContainers, c)
+					pod.Status.InitContainerStatuses = append(pod.Status.InitContainerStatuses, v1.ContainerStatus{
+						Name: name, Image: c.Image, ImageID: name + "-old", ContainerID: name + "-original", Started: &started,
+						Resources: oldResources.DeepCopy(), Ready: false,
+					})
+				}
+				spec.InitContainerImages = map[string]string{"a-sidecar": "a-sidecar:v2"}
+				if tc.imageOnly {
+					spec.InitContainerImages["z-sidecar"] = "z-sidecar:v2"
+				} else {
+					spec.ContainerResources["z-sidecar"] = target
+					spec.ContainerResources["a-sidecar"] = target
+				}
+			}
+			state := &appspub.InPlaceUpdateState{
+				Revision: spec.Revision, UpdateImages: true, UpdateResources: true,
+			}
+			pod, expectedResources, err := defaultPatchUpdateSpecToPod(pod, spec, state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Emulate the first /resize call; later calls go through the test adapter.
+			verticalUpdateImpl.UpdateResource(pod, expectedResources)
+			cli := fake.NewClientBuilder().WithStatusSubresource(&v1.Pod{}).WithObjects(pod).Build()
+			ctrl := New(cli, revisionadapter.NewDefaultImpl()).(*realControl)
+			ctrl.podAdapter = &resourceBatchTestAdapter{AdapterRuntimeClient: &podadapter.AdapterRuntimeClient{Client: cli}}
+			key := types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}
+			refresh := func() *v1.Pod {
+				t.Helper()
+				current := &v1.Pod{}
+				if err := cli.Get(context.TODO(), key, current); err != nil {
+					t.Fatal(err)
+				}
+				if result := ctrl.Refresh(current, nil); result.RefreshErr != nil {
+					t.Fatal(result.RefreshErr)
+				}
+				if err := cli.Get(context.TODO(), key, current); err != nil {
+					t.Fatal(err)
+				}
+				return current
+			}
+			readState := func(current *v1.Pod) appspub.InPlaceUpdateState {
+				t.Helper()
+				var s appspub.InPlaceUpdateState
+				if err := json.Unmarshal([]byte(current.Annotations[appspub.InPlaceUpdateStateKey]), &s); err != nil {
+					t.Fatal(err)
+				}
+				return s
+			}
+			assertBlocked := func(batchCount int) *v1.Pod {
+				t.Helper()
+				got := refresh()
+				if n := len(readState(got).ContainerBatchesRecord); n != batchCount {
+					t.Fatalf("advanced before the batch completed: got %d batches, want %d", n, batchCount)
+				}
+				if got.Status.Conditions[0].Status != v1.ConditionFalse {
+					t.Fatal("update marked ready before the current batch completed")
+				}
+				return got
+			}
+			current := pod
+			for batchIndex, names := range tc.batches {
+				state := readState(current)
+				if len(state.ContainerBatchesRecord) != batchIndex+1 ||
+					!reflect.DeepEqual(state.ContainerBatchesRecord[batchIndex].Containers, names) {
+					t.Fatalf("unexpected batch %d: %+v, want %v", batchIndex, state.ContainerBatchesRecord, names)
+				}
+				if tc.sidecars && batchIndex < 2 && batchIndex+1 < len(tc.batches) {
+					if state.PreCheckBeforeNext == nil || len(state.PreCheckBeforeNext.ContainersRequiredReady) != 0 ||
+						!reflect.DeepEqual(state.PreCheckBeforeNext.ContainersRequiredStarted, names) {
+						t.Fatalf("sidecar batch has wrong barrier: %+v", state.PreCheckBeforeNext)
+					}
+				}
+				current = assertBlocked(batchIndex + 1)
+				batch := sets.NewString(names...)
+				for _, containers := range [][]v1.Container{current.Spec.Containers, current.Spec.InitContainers} {
+					for _, c := range containers {
+						if !batch.Has(c.Name) {
+							continue
+						}
+						var status *v1.ContainerStatus
+						for i := range current.Status.ContainerStatuses {
+							if current.Status.ContainerStatuses[i].Name == c.Name {
+								status = &current.Status.ContainerStatuses[i]
+							}
+						}
+						for i := range current.Status.InitContainerStatuses {
+							if current.Status.InitContainerStatuses[i].Name == c.Name {
+								status = &current.Status.InitContainerStatuses[i]
+							}
+						}
+						status.Image = c.Image
+						status.ImageID = c.Name + "-new"
+						status.Resources = c.Resources.DeepCopy()
+						notStarted := false
+						if c.RestartPolicy != nil {
+							status.Started = &notStarted
+						} else {
+							status.Ready = false
+						}
+					}
+				}
+				if err := cli.Status().Update(context.TODO(), current); err != nil {
+					t.Fatal(err)
+				}
+				if batchIndex+1 < len(tc.batches) || (tc.sidecars && batchIndex < 2) {
+					current = assertBlocked(batchIndex + 1)
+				}
+				for i := range current.Status.InitContainerStatuses {
+					if batch.Has(current.Status.InitContainerStatuses[i].Name) {
+						current.Status.InitContainerStatuses[i].Started = &started
+						// Keep Ready false: native sidecar progression must only require Started.
+					}
+				}
+				for i := range current.Status.ContainerStatuses {
+					if batch.Has(current.Status.ContainerStatuses[i].Name) {
+						current.Status.ContainerStatuses[i].Ready = true
+					}
+				}
+				if err := cli.Status().Update(context.TODO(), current); err != nil {
+					t.Fatal(err)
+				}
+				current = refresh()
+			}
+			if err := DefaultCheckInPlaceUpdateCompleted(current); err != nil {
+				t.Fatalf("update remained incomplete: %v", err)
+			}
+			stateValue := readState(current)
+			if len(stateValue.NextContainerImages) != 0 || len(stateValue.NextInitContainerImages) != 0 ||
+				len(stateValue.NextContainerResources) != 0 || current.UID != "original-pod" {
+				t.Fatalf("pending updates or changed Pod identity: %+v", stateValue)
+			}
+			for _, status := range append(current.Status.ContainerStatuses, current.Status.InitContainerStatuses...) {
+				if status.Name == "meshproxy" || status.Name == "z-sidecar" {
+					if status.ContainerID != status.Name+"-original" || status.RestartCount != 0 {
+						t.Fatal("resource-only target identity changed")
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestNativeSidecarStartedBarrier(t *testing.T) {
+	started, notStarted := true, false
+	for _, tc := range []struct {
+		name    string
+		status  *v1.ContainerStatus
+		wantErr bool
+	}{
+		{name: "missing status", wantErr: true},
+		{name: "missing Started", status: &v1.ContainerStatus{Name: "sidecar", Ready: true}, wantErr: true},
+		{name: "Ready does not replace Started", status: &v1.ContainerStatus{Name: "sidecar", Ready: true, Started: &notStarted}, wantErr: true},
+		{name: "Started permits not Ready", status: &v1.ContainerStatus{Name: "sidecar", Ready: false, Started: &started}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := &v1.Pod{}
+			if tc.status != nil {
+				pod.Status.InitContainerStatuses = []v1.ContainerStatus{*tc.status}
+			}
+			preCheck := &appspub.InPlaceUpdatePreCheckBeforeNext{ContainersRequiredStarted: []string{"sidecar"}}
+			if err := doPreCheckBeforeNext(pod, preCheck); (err != nil) != tc.wantErr {
+				t.Fatalf("unexpected Started barrier result: %v", err)
+			}
+		})
+	}
+}
+
+func TestSequentialSidecarRollbackImageIdentity(t *testing.T) {
+	started := true
+	sidecar := v1.Container{Name: "sidecar", Image: "sidecar:v1", RestartPolicy: restartAlways()}
+	forward := *sidecar.DeepCopy()
+	forward.Image = "sidecar:v2"
+	for _, withRuntimeMeta := range []bool{false, true} {
+		t.Run(fmt.Sprintf("runtime-meta-%v", withRuntimeMeta), func(t *testing.T) {
+			pod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}},
+				Spec:       v1.PodSpec{InitContainers: []v1.Container{sidecar}},
+				Status: v1.PodStatus{InitContainerStatuses: []v1.ContainerStatus{{
+					Name: "sidecar", Image: forward.Image, ImageID: "forward-image", ContainerID: "forward-container", Started: &started,
+				}}},
+			}
+			state := appspub.InPlaceUpdateState{
+				UpdateImages:           true,
+				LastContainerStatuses:  map[string]appspub.InPlaceUpdateContainerStatus{"sidecar": {ImageID: "rollback-image"}},
+				ContainerBatchesRecord: []appspub.InPlaceUpdateContainerBatch{{Containers: []string{"sidecar"}}},
+			}
+			if withRuntimeMeta {
+				meta := appspub.RuntimeContainerMetaSet{Containers: []appspub.RuntimeContainerMeta{{
+					Name: "sidecar", ContainerID: "forward-container",
+					Hashes: appspub.RuntimeContainerHashes{PlainHash: kubeletcontainer.HashContainer(&forward)},
+				}}}
+				pod.Annotations[appspub.RuntimeContainerMetaKey] = string(mustMarshal(meta))
+			}
+			if err := defaultCheckContainersInPlaceUpdateCompleted(pod, &state); err == nil {
+				t.Fatal("Started on the forward image must not complete a rollback batch")
+			}
+			pod.Status.InitContainerStatuses[0].Image = sidecar.Image
+			pod.Status.InitContainerStatuses[0].ImageID = "rollback-image"
+			pod.Status.InitContainerStatuses[0].ContainerID = "rollback-container"
+			if withRuntimeMeta {
+				meta := appspub.RuntimeContainerMetaSet{Containers: []appspub.RuntimeContainerMeta{{
+					Name: "sidecar", ContainerID: "rollback-container",
+					Hashes: appspub.RuntimeContainerHashes{PlainHash: kubeletcontainer.HashContainer(&sidecar)},
+				}}}
+				pod.Annotations[appspub.RuntimeContainerMetaKey] = string(mustMarshal(meta))
+			}
+			if err := defaultCheckContainersInPlaceUpdateCompleted(pod, &state); err != nil {
+				t.Fatalf("target sidecar instance should complete rollback: %v", err)
+			}
+		})
+	}
+}
+
+func TestSequentialSidecarMetadataEnvFallback(t *testing.T) {
+	setInitContainerGate(t, true)
+	defer setInitContainerGate(t, false)
+	defer utilfeature.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlaceUpdateEnvFromMetadata, true)()
+	old := &v1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"version": "v1"}},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{{Name: "main", Image: "main:v1"}},
+			InitContainers: []v1.Container{{Name: "sidecar", Image: "sidecar:v1", RestartPolicy: restartAlways(), Env: []v1.EnvVar{{
+				Name: "VERSION", ValueFrom: &v1.EnvVarSource{FieldRef: &v1.ObjectFieldSelector{FieldPath: "metadata.labels['version']"}},
+			}}}},
+		},
+	}
+	updated := old.DeepCopy()
+	updated.Labels["version"] = "v2"
+	updated.Spec.InitContainers[0].Image = "sidecar:v2"
+	oldRevision := revisionOf("old", string(mustMarshal(map[string]interface{}{"spec": map[string]interface{}{"template": old}})))
+	newRevision := revisionOf("new", string(mustMarshal(map[string]interface{}{"spec": map[string]interface{}{"template": updated}})))
+	if spec := defaultCalculateInPlaceUpdateSpec(oldRevision, newRevision, nil); spec != nil {
+		t.Fatalf("shared sidecar metadata env update cannot be isolated into ordered batches: %+v", spec)
+	}
+}
+
+func TestSidecarBatchStateDeepCopy(t *testing.T) {
+	state := &appspub.InPlaceUpdateState{
+		NextInitContainerImages: map[string]string{"sidecar": "sidecar:v2"},
+		CurrentInitContainerResources: map[string]v1.ResourceRequirements{"sidecar": {
+			Requests: initContainerTestResources("200m", "256Mi"),
+		}},
+		PreCheckBeforeNext: &appspub.InPlaceUpdatePreCheckBeforeNext{ContainersRequiredStarted: []string{"sidecar"}},
+	}
+	copied := state.DeepCopy()
+	copied.NextInitContainerImages["sidecar"] = "sidecar:v3"
+	copied.CurrentInitContainerResources["sidecar"].Requests[v1.ResourceCPU] = resource.MustParse("500m")
+	copied.PreCheckBeforeNext.ContainersRequiredStarted[0] = "other"
+	originalResources := state.CurrentInitContainerResources["sidecar"]
+	if state.NextInitContainerImages["sidecar"] != "sidecar:v2" ||
+		!originalResources.Requests.Cpu().Equal(resource.MustParse("200m")) ||
+		state.PreCheckBeforeNext.ContainersRequiredStarted[0] != "sidecar" {
+		t.Fatal("DeepCopy aliases sidecar batch state")
+	}
+}
+
+func mustMarshal(value interface{}) []byte {
+	data, err := json.Marshal(value)
+	if err != nil {
+		panic(err)
+	}
+	return data
 }

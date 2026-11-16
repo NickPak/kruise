@@ -76,6 +76,10 @@ type InPlaceUpdateState struct {
 	// NextContainerImages is the containers with lower priority that waiting for in-place update images in next batch.
 	NextContainerImages map[string]string `json:"nextContainerImages,omitempty"`
 
+	// NextInitContainerImages records pending native sidecar images. They are applied in init
+	// container spec order before ordinary container updates.
+	NextInitContainerImages map[string]string `json:"nextInitContainerImages,omitempty"`
+
 	// NextContainerRefMetadata is the containers with lower priority that waiting for in-place update labels/annotations in next batch.
 	NextContainerRefMetadata map[string]metav1.ObjectMeta `json:"nextContainerRefMetadata,omitempty"`
 
@@ -92,6 +96,8 @@ type InPlaceUpdateState struct {
 // InPlaceUpdatePreCheckBeforeNext contains the pre-check that must pass before the next containers can be in-place update.
 type InPlaceUpdatePreCheckBeforeNext struct {
 	ContainersRequiredReady []string `json:"containersRequiredReady,omitempty"`
+	// ContainersRequiredStarted follows native sidecar startup semantics, independently of Ready.
+	ContainersRequiredStarted []string `json:"containersRequiredStarted,omitempty"`
 }
 
 // InPlaceUpdateContainerBatch indicates the timestamp and containers for a batch update
